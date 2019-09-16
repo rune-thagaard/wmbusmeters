@@ -29,12 +29,15 @@ struct MeterApator162 : public virtual WaterMeter, public virtual MeterCommonImp
     // Total water counted through the meter
     double totalWaterConsumption(Unit u);
     bool  hasTotalWaterConsumption();
+    string initDate();
 
 private:
 
     void processContent(Telegram *t);
 
     double total_water_consumption_m3_ {};
+
+    string init_date_;
 };
 
 unique_ptr<WaterMeter> createApator162(WMBus *bus, MeterInfo &mi)
@@ -60,7 +63,17 @@ MeterApator162::MeterApator162(WMBus *bus, MeterInfo &mi) :
              "The total water consumption recorded by this meter.",
              true, true);
 
+    addPrint("init_date", Quantity::Text,
+             [&](){ return initDate(); },
+             "The most recent billing period date.",
+             true, true);
+
     MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
+}
+
+string MeterApator162::initDate()
+{
+    return init_date_;
 }
 
 double MeterApator162::totalWaterConsumption(Unit u)
@@ -91,6 +104,19 @@ void MeterApator162::processContent(Telegram *t)
     // to extract using the existing tools.
     map<string,pair<int,DVEntry>> vendor_values;
 
+    int dhi = t->content[12];
+    int dlo = t->content[11];
+    int days = dhi*256 + dlo;
+
+    struct tm date;
+    time_t now = time(NULL);
+    const time_t ONE_DAY = 24 * 60 * 60 ;
+    time_t date_seconds = now - (days*ONE_DAY) ;
+    localtime_r(&date_seconds, &date);
+    init_date_ = strdate(&date);
+    debug("(apator162) init date extracted from offset 11,12 0x%02x%02x: %d days -> init date %s\n",
+          t->content[11], t->content[12]&0x7f, days, init_date_.c_str());
+
     string total;
     // Current assumption of this proprietary protocol is that byte 13 tells
     // us where the current total water consumption is located.
@@ -116,7 +142,7 @@ void MeterApator162::processContent(Telegram *t)
     }
 
     strprintf(total, "%02x%02x%02x%02x", t->content[o], t->content[o+1], t->content[o+2], t->content[o+3]);
-    debug("(apator162) Guessing offset to be %d from byte 0x%02x: total %s\n", o, t->content[13], total.c_str());
+    debug("(apator162) guessing offset of total consumption to be %d from byte 0x%02x: total %s\n", o, t->content[13], total.c_str());
 
     vendor_values["0413"] = { 25, DVEntry(0x13, 0, 0, 0, total) };
     int offset;
