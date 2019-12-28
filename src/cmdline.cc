@@ -218,6 +218,37 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
+        if (!strncmp(argv[i], "--meterfilestimestamp", 21)) {
+            if (strlen(argv[i]) > 22 && argv[i][21] == '=') {
+                if (!strncmp(argv[i]+22, "day", 3))
+                {
+                    c->meterfiles_timestamp = MeterFileTimestamp::Day;
+                }
+                else if (!strncmp(argv[i]+22, "hour", 4))
+                {
+                    c->meterfiles_timestamp = MeterFileTimestamp::Hour;
+                }
+                else if (!strncmp(argv[i]+22, "minute", 6))
+                {
+                    c->meterfiles_timestamp = MeterFileTimestamp::Minute;
+                }
+                else if (!strncmp(argv[i]+22, "micros", 5))
+                {
+                    c->meterfiles_timestamp = MeterFileTimestamp::Micros;
+                }
+                else if (!strncmp(argv[i]+22, "never", 5))
+                {
+                    c->meterfiles_timestamp = MeterFileTimestamp::Never;
+                } else
+                {
+                    error("No such meter file timestamp \"%s\"\n", argv[i]+22);
+                }
+            } else {
+                error("Incorrect option %s\n", argv[i]);
+            }
+            i++;
+            continue;
+        }
         if (!strcmp(argv[i], "--meterfiles") ||
             (!strncmp(argv[i], "--meterfiles", 12) &&
              strlen(argv[i]) > 12 &&
@@ -258,6 +289,19 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
+        if (!strncmp(argv[i], "--json_", 7))
+        {
+            // For example: --json_floor=42
+            string json = string(argv[i]+7);
+            if (json == "") {
+                error("The json command cannot be empty.\n");
+            }
+            // The extra "floor"="42" will be pushed to the json.
+            debug("Added json %s\n", json.c_str());
+            c->jsons.push_back(json);
+            i++;
+            continue;
+        }
         if (!strncmp(argv[i], "--shellenvs", 11)) {
             c->list_shell_envs = true;
             i++;
@@ -272,6 +316,14 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             c->exitafter = parseTime(argv[i]+12);
             if (c->exitafter <= 0) {
                 error("Not a valid time to exit after. \"%s\"\n", argv[i]+12);
+            }
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--reopenafter=", 12) && strlen(argv[i]) > 14) {
+            c->reopenafter = parseTime(argv[i]+14);
+            if (c->reopenafter <= 0) {
+                error("Not a valid time to reopen after. \"%s\"\n", argv[i]+14);
             }
             i++;
             continue;
@@ -338,10 +390,10 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
         mt = toMeterType(type);
 
         if (mt == MeterType::UNKNOWN) error("Not a valid meter type \"%s\"\n", type.c_str());
-        if (!isValidMatchExpressions(id, false)) error("Not a valid id nor a valid meter match expression \"%s\"\n", id.c_str());
-        if (!isValidKey(key)) error("Not a valid meter key \"%s\"\n", key.c_str());
-        vector<string> no_meter_shells;
-        c->meters.push_back(MeterInfo(name, type, id, key, modes, no_meter_shells));
+        if (!isValidMatchExpressions(id, true)) error("Not a valid id nor a valid meter match expression \"%s\"\n", id.c_str());
+        if (!isValidKey(key, mt)) error("Not a valid meter key \"%s\"\n", key.c_str());
+        vector<string> no_meter_shells, no_meter_jsons;
+        c->meters.push_back(MeterInfo(name, type, id, key, modes, no_meter_shells, no_meter_jsons));
     }
 
     return unique_ptr<Configuration>(c);

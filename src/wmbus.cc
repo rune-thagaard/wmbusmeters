@@ -410,68 +410,97 @@ string mediaTypeJSON(int a_field_device_type)
 
 bool detectIM871A(string device, SerialCommunicationManager *handler);
 bool detectAMB8465(string device, SerialCommunicationManager *handler);
+bool detectRawTTY(string device, int baud, SerialCommunicationManager *handler);
 bool detectRTLSDR(string device, SerialCommunicationManager *handler);
+bool detectCUL(string device, SerialCommunicationManager *handler);
 
-pair<MBusDeviceType,string> detectMBusDevice(string device, SerialCommunicationManager *handler)
+Detected detectAuto(string devicefile,
+                    string suffix,
+                    SerialCommunicationManager *handler)
 {
-    // If auto, then assume that uev has been configured with
-    // with the file: `/etc/udev/rules.d/99-usb-serial.rules` containing
-    // SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="im871a",MODE="0660", GROUP="yourowngroup"
-    // SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="amb8465",MODE="0660", GROUP="yourowngroup"
-
-    if (device == "rtlwmbus")
+    if (suffix != "")
     {
-        return { DEVICE_RTLWMBUS, "" };
-    }
-    if (device == "auto")
-    {
-        if (detectIM871A("/dev/im871a", handler))
-        {
-            return { DEVICE_IM871A, "/dev/im871a" };
-        }
-        else
-        {
-            AccessCheck ac = checkIfExistsAndSameGroup("/dev/im871a");
-            if (ac == AccessCheck::NotSameGroup) {
-                error("You are not in the same group as the device /dev/im871a\n");
-            }
-        }
-
-        if (detectAMB8465("/dev/amb8465", handler))
-        {
-            return { DEVICE_AMB8465, "/dev/amb8465" };
-        }
-        else
-        {
-            AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
-            if (ac == AccessCheck::NotSameGroup) {
-                error("You are not in the same group as the device /dev/amb8465\n");
-            }
-        }
-
-        if (detectRTLSDR("/dev/rtlsdr", handler))
-        {
-            return { DEVICE_RTLWMBUS, "rtlwmbus" };
-        }
-        else
-        {
-            AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
-            if (ac == AccessCheck::NotSameGroup) {
-                error("You are not in the same group as the device /dev/rtlsdr\n");
-            }
-        }
-
-        return { DEVICE_UNKNOWN, "" };
+        error("You cannot have a suffix appended to auto.\n");
     }
 
-    if (checkIfSimulationFile(device.c_str()))
+    if (detectIM871A("/dev/im871a", handler))
     {
-        return { DEVICE_SIMULATOR, device };
+        return { DEVICE_IM871A, "/dev/im871a", 0, false };
+    }
+    else
+    {
+        AccessCheck ac = checkIfExistsAndSameGroup("/dev/im871a");
+        if (ac == AccessCheck::NotSameGroup)
+        {
+            // The device exists but we cannot read it!
+            error("You are not in the same group as the device /dev/im871a\n");
+        }
     }
 
-    // If not auto, then test the device, is it a character device?
-    checkCharacterDeviceExists(device.c_str(), true);
+    if (detectAMB8465("/dev/amb8465", handler))
+    {
+        return { DEVICE_AMB8465, "/dev/amb8465", false };
+    }
+    else
+    {
+        AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
+        if (ac == AccessCheck::NotSameGroup)
+        {
+            // The device exists but we cannot read it!
+            error("You are not in the same group as the device /dev/amb8465\n");
+        }
+    }
 
+    if (detectRawTTY("/dev/rfmrx2", 38400, handler))
+    {
+        return { DEVICE_RFMRX2, "/dev/rfmrx2", false };
+    }
+    else
+    {
+        AccessCheck ac = checkIfExistsAndSameGroup("/dev/rfmrx2");
+        if (ac == AccessCheck::NotSameGroup)
+        {
+            // The device exists but we cannot read it!
+            error("You are not in the same group as the device /dev/rfmrx2\n");
+        }
+    }
+
+    if (detectRTLSDR("/dev/rtlsdr", handler))
+    {
+        return { DEVICE_RTLWMBUS, "rtlwmbus" };
+    }
+    else
+    {
+        AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
+        if (ac == AccessCheck::NotSameGroup)
+        {
+            // The device exists but we cannot read it!
+            error("You are not in the same group as the device /dev/rtlsdr\n");
+        }
+    }
+
+    if (detectCUL("/dev/ttyUSB0", handler))
+    {
+        return { DEVICE_CUL, "/dev/ttyUSB0" };
+    }
+    else
+    {
+        AccessCheck ac = checkIfExistsAndSameGroup("/dev/ttyUSB0");
+        if (ac == AccessCheck::NotSameGroup)
+        {
+            // The device exists but we cannot read it!
+            error("You are not in the same group as the device CUL\n");
+        }
+    }
+
+    // We could not auto-detect any device.
+    return { DEVICE_UNKNOWN, "", false };
+}
+
+Detected detectImstAmberCul(string devicefile,
+                            string suffix,
+                            SerialCommunicationManager *handler)
+{
     // If im87a is tested first, a delay of 1s must be inserted
     // before amb8465 is tested, lest it will not respond properly.
     // It really should not matter, but perhaps is the uart of the amber
@@ -481,19 +510,110 @@ pair<MBusDeviceType,string> detectMBusDevice(string device, SerialCommunicationM
 
     // Talk amb8465 with it...
     // assumes this device is configured for 9600 bps, which seems to be the default.
-    if (detectAMB8465(device, handler))
+    if (detectAMB8465(devicefile, handler))
     {
-        return { DEVICE_AMB8465, device };
+        return { DEVICE_AMB8465, devicefile, false };
     }
     // Talk im871a with it...
     // assumes this device is configured for 57600 bps, which seems to be the default.
-    if (detectIM871A(device, handler))
+    if (detectIM871A(devicefile, handler))
     {
-        return { DEVICE_IM871A, device };
+        return { DEVICE_IM871A, devicefile, false };
+    }
+    // Talk CUL with it...
+    // assumes this device is configured for 38400 bps, which seems to be the default.
+    if (detectCUL(devicefile, handler))
+    {
+        return { DEVICE_CUL, devicefile, false };
     }
 
-    return { DEVICE_UNKNOWN, "" };
+    // We could not auto-detect either.
+    return { DEVICE_UNKNOWN, "", false };
 }
+
+/**
+  The devicefile can be:
+
+  auto (to autodetect the device)
+  /dev/ttyUSB0 (to use this character device)
+  /home/me/simulation.txt or /home/me/simulation_foo.txt (to use the wmbusmeters telegram=|....|+32 format)
+  /home/me/telegram.raw (to read bytes from this file)
+  stdin (to read bytes from stdin)
+
+  If a suffix he suffix can be:
+  im871a
+  amb8465
+  rfmrx2
+  rtlwmbus: the devicefile produces rtlwmbus messages, ie. T1;1;1;2019-04-03 19:00:42.000;97;148;88888888;0x6e440106...ae03a77
+  simulation: assume the devicefile produces telegram=|....|+xx lines. This can also pace the simulated telegrams in time.
+  a baud rate like 38400: assume the devicefile is a raw tty character device.
+*/
+Detected detectWMBusDeviceSetting(string devicefile,
+                                  string suffix,
+                                  SerialCommunicationManager *handler)
+{
+    debug("(detect) \"%s\" \"%s\"\n", devicefile.c_str(), suffix.c_str());
+    // Look for /dev/im871a /dev/amb8465 /dev/rfmrx2 /dev/rtlsdr
+    if (devicefile == "auto")
+    {
+        debug("(detect) driver: auto\n");
+        return detectAuto(devicefile, suffix, handler);
+    }
+
+    // If the devicefile is rtlwmbus then the suffix can be a frequency
+    // or the actual command line to use.
+    // E.g. rtlwmbus rtlwmbux:868.95M rtlwmbus:rtl_sdr | rtl_wmbus
+    if (devicefile == "rtlwmbus")
+    {
+        debug("(detect) driver: rtlwmbus\n");
+        return { DEVICE_RTLWMBUS, "", false };
+    }
+
+    // Is it a file named simulation_xxx.txt ?
+    if (checkIfSimulationFile(devicefile.c_str()))
+    {
+        debug("(detect) driver: simulation file\n");
+        return { DEVICE_SIMULATOR, devicefile, false };
+    }
+
+    bool is_tty = checkCharacterDeviceExists(devicefile.c_str(), false);
+    bool is_stdin = devicefile == "stdin";
+    bool is_file = checkFileExists(devicefile.c_str());
+
+    debug("(detect) is_tty=%d is_stdin=%d is_file=%d\n", is_tty, is_stdin, is_file);
+    if (!is_tty && !is_stdin && !is_file)
+    {
+        debug("(detect) not a valid device file %s\n", devicefile.c_str());
+        // Oups, not a valid devicefile.
+        return { DEVICE_UNKNOWN, "", false };
+    }
+
+    bool override_tty = !is_tty;
+
+    if (suffix == "amb8465") return { DEVICE_AMB8465, devicefile, 0, override_tty };
+    if (suffix == "im871a") return { DEVICE_IM871A, devicefile, 0, override_tty };
+    if (suffix == "rfmrx2") return { DEVICE_RFMRX2, devicefile, 0, override_tty };
+    if (suffix == "rtlwmbus") return { DEVICE_RTLWMBUS, devicefile, 0, override_tty };
+    if (suffix == "cul") return { DEVICE_CUL, devicefile, 0, override_tty };
+    if (suffix == "simulation") return { DEVICE_SIMULATOR, devicefile, 0, override_tty };
+
+    // If the suffix is a number, then assume that it is a baud rate.
+    if (isNumber(suffix)) return { DEVICE_RAWTTY, devicefile, atoi(suffix.c_str()), override_tty };
+
+    // If the suffix is empty and its not a tty, then read raw telegrams from stdin or the file.
+    if (suffix == "" && !is_tty) return { DEVICE_RAWTTY, devicefile, 0, true };
+
+    if (suffix != "")
+    {
+        error("Unknown device suffix %s\n", suffix.c_str());
+    }
+
+    // Ok, we are left with a single /dev/ttyUSB0 lets talk to it
+    // to figure out what is connected to it. We currently only
+    // know how to detect Imst, Amber or CUL dongles.
+    return detectImstAmberCul(devicefile, suffix, handler);
+}
+
 
 string ciType(int ci_field)
 {
@@ -580,16 +700,30 @@ void Telegram::addMoreExplanation(int pos, const char* fmt, ...)
     }
 }
 
-void Telegram::parse(vector<uchar> &frame)
+bool Telegram::parse(vector<uchar> &frame)
 {
     vector<uchar>::iterator bytes = frame.begin();
     parsed.clear();
-    if (frame.size() == 0) return;
+    if (frame.size() == 0) return false;
+    if (frame.size() < 11)
+    {
+        verbose("(wmbus) cannot parse telegram with length %zu\n", frame.size());
+        return false;
+    }
     len = frame[0];
+    if ((int)len+1 > (int)frame.size())
+    {
+        // I have some bad test data, that needs to be cleaned out...
+        verbose("(wmbus) error not enough bytes frame=%zu but len=%zu\n", frame.size(), len);
+    }
+    if ((int)len+1 != (int)frame.size())
+    {
+        // I have some bad test data, that needs to be cleaned out...
+        verbose("(wmbus) discrepancy frame=%zu should be len=%zu\n", frame.size(), len);
+    }
     addExplanation(bytes, 1, "%02x length (%d bytes)", len, len);
     c_field = frame[1];
     addExplanation(bytes, 1, "%02x c-field (%s)", c_field, cType(c_field).c_str());
-    if (frame.size() < 4) return;
     m_field = frame[3]<<8 | frame[2];
     string man = manufacturerFlag(m_field);
     addExplanation(bytes, 2, "%02x%02x m-field (%02x=%s)", frame[2], frame[3], m_field, man.c_str());
@@ -612,10 +746,18 @@ void Telegram::parse(vector<uchar> &frame)
     addExplanation(bytes, 1, "%02x ci-field (%s)", ci_field, ciType(ci_field).c_str());
 
     int header_size = 0;
-    if (ci_field == 0x78) {
+    if (ci_field == 0x78)
+    {
         header_size = 0; // And no encryption possible.
-    } else
-    if (ci_field == 0x72) {
+    }
+    else if (ci_field == 0x72)
+    {
+        if (frame.size() < 22)
+        {
+            verbose("(wmbus) cannot parse telegram ci=0x72 with length %zu\n", frame.size());
+            return false;
+        }
+
         // Example, begins aith frame[11]: 99999999 MMMM VV TT 01 00 0000
         // Ignore 4 id bytes for now, should perhaps check that they are identical with the id.
         // But if they are not, what to do?
@@ -641,8 +783,14 @@ void Telegram::parse(vector<uchar> &frame)
         if (config_info.length() > 0) config_info.pop_back();
         addExplanation(bytes, 2, "%02x%02x config (%s)", frame[13], frame[14], config_info.c_str());
         header_size = 4+8;
-    } else
-    if (ci_field == 0x7a) {
+    }
+    else if (ci_field == 0x7a)
+    {
+        if (frame.size() < 15)
+        {
+            verbose("(wmbus) cannot parse telegram ci=0x7a with length %zu\n", frame.size());
+            return false;
+        }
         acc = frame[11];
         addExplanation(bytes, 1, "%02x acc", acc);
         status = frame[12];
@@ -662,23 +810,51 @@ void Telegram::parse(vector<uchar> &frame)
         if (config_info.length() > 0) config_info.pop_back();
         addExplanation(bytes, 2, "%02x%02x config (%s)", frame[13], frame[14], config_info.c_str());
         header_size = 4;
-    } else
-    if (ci_field == 0x8d || ci_field == 0x8c) {
+    }
+    else if (ci_field == 0x8d || ci_field == 0x8c)
+    {
+        if (frame.size() < 13)
+        {
+            verbose("(wmbus) cannot parse telegram ci=0x8d or 0x8c with length %zu\n", frame.size());
+            return false;
+        }
         cc_field = frame[11];
         addExplanation(bytes, 1, "%02x cc-field (%s)", cc_field, ccType(cc_field).c_str());
         acc = frame[12];
         addExplanation(bytes, 1, "%02x acc", acc);
         header_size = 2;
-        if (ci_field == 0x8d) {
+        if (ci_field == 0x8d)
+        {
+            if (frame.size() < 17)
+            {
+                verbose("(wmbus) cannot parse telegram ci=0x8d with length %zu\n", frame.size());
+                return false;
+            }
+            string sn_info;
             sn[0] = frame[13];
             sn[1] = frame[14];
             sn[2] = frame[15];
             sn[3] = frame[16];
-            addExplanation(bytes, 4, "%02x%02x%02x%02x sn", sn[0], sn[1], sn[2], sn[3]);
+            uint64_t sn_field = sn[3]<<24 | sn[2]<<16 | sn[1] << 8 | sn[0];
+
+            uchar session_field = (sn_field >> 0)  & 0x0f; // lowest 4 bits
+            uint64_t time_field = (sn_field >> 4)  & 0x1ffffff; // next 25 bits
+            uchar enc_field     = (sn_field >> 29) & 0x7; // next 3 bits.
+            if (enc_field != 0)
+            {
+                sn_info += "encrypted ";
+                is_encrypted_ = true;
+            }
+            sn_info += "session=";
+            sn_info += to_string(session_field)+" ";
+            sn_info += "time=";
+            sn_info += to_string(time_field);
+            addExplanation(bytes, 4, "%02x%02x%02x%02x sn (%s)", sn[0], sn[1], sn[2], sn[3], sn_info.c_str());
             header_size = 6;
         }
-    } else
-    if (ci_field == 0xa2) {
+    }
+    else if (ci_field == 0xa2)
+    {
         // Manufacturer specific telegram payload. Oh well....
     }
     else
@@ -688,7 +864,13 @@ void Telegram::parse(vector<uchar> &frame)
     }
 
     payload.clear();
-    payload.insert(payload.end(), frame.begin()+(11+header_size), frame.end());
+    int skip = 11+header_size;
+    if (skip < (int)frame.size())
+    {
+        // The case 11+header_size larger than frame_size is probably due to bad input data
+        // that is currently allowed to pass, see above.
+        payload.insert(payload.end(), frame.begin()+skip, frame.end());
+    }
     verbose("(wmbus) received telegram");
     verboseFields();
     debugPayload("(wmbus) frame", frame);
@@ -696,6 +878,7 @@ void Telegram::parse(vector<uchar> &frame)
     if (isDebugEnabled()) {
         explainParse("(wmbus)", 0);
     }
+    return true;
 }
 
 void Telegram::explainParse(string intro, int from)
@@ -809,6 +992,18 @@ string difType(int dif)
         s += " storagenr=1";
     }
     return s;
+}
+
+MeasurementType difMeasurementType(int dif)
+{
+    int t = dif & 0x30;
+    switch (t) {
+    case 0x00: return MeasurementType::Instantaneous;
+    case 0x10: return MeasurementType::Maximum;
+    case 0x20: return MeasurementType::Minimum;
+    case 0x30: return MeasurementType::AtError;
+    }
+    assert(0);
 }
 
 string vifType(int vif)
@@ -2231,6 +2426,18 @@ string linkModeName(LinkMode link_mode)
         }
     }
     return "UnknownLinkMode";
+}
+
+string measurementTypeName(MeasurementType mt)
+{
+    switch (mt) {
+    case MeasurementType::Instantaneous: return "instantaneous";
+    case MeasurementType::Maximum: return "maximum";
+    case MeasurementType::Minimum: return "minimum";
+    case MeasurementType::AtError: return "aterror";
+    case MeasurementType::Unknown: return "unknown";
+    }
+    assert(0);
 }
 
 WMBus::~WMBus() {

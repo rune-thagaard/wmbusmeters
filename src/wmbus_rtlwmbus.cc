@@ -33,7 +33,8 @@ using namespace std;
 
 enum FrameStatus { PartialFrame, FullFrame, ErrorInFrame, TextAndNotFrame };
 
-struct WMBusRTLWMBUS : public WMBus {
+struct WMBusRTLWMBUS : public WMBus
+{
     bool ping();
     uint32_t getDeviceId();
     LinkModeSet getLinkModes();
@@ -75,21 +76,19 @@ private:
 };
 
 unique_ptr<WMBus> openRTLWMBUS(string command, SerialCommunicationManager *manager,
-                               function<void()> on_exit)
+                               function<void()> on_exit, unique_ptr<SerialDevice> serial_override)
 {
     vector<string> args;
     vector<string> envs;
     args.push_back("-c");
     args.push_back(command);
+    if (serial_override)
+    {
+        WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(std::move(serial_override), manager);
+        return unique_ptr<WMBus>(imp);
+    }
     auto serial = manager->createSerialDeviceCommand("/bin/sh", args, envs, on_exit);
     WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(std::move(serial), manager);
-    return unique_ptr<WMBus>(imp);
-}
-
-unique_ptr<WMBus> openRTLWMBUS(string command, SerialCommunicationManager *manager, SerialDevice *serial,
-                               function<void()> on_exit)
-{
-    WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(unique_ptr<SerialDevice>(serial), manager);
     return unique_ptr<WMBus>(imp);
 }
 
@@ -100,15 +99,18 @@ WMBusRTLWMBUS::WMBusRTLWMBUS(unique_ptr<SerialDevice> serial, SerialCommunicatio
     serial_->open(true);
 }
 
-bool WMBusRTLWMBUS::ping() {
+bool WMBusRTLWMBUS::ping()
+{
     return true;
 }
 
-uint32_t WMBusRTLWMBUS::getDeviceId() {
+uint32_t WMBusRTLWMBUS::getDeviceId()
+{
     return 0x11111111;
 }
 
-LinkModeSet WMBusRTLWMBUS::getLinkModes() {
+LinkModeSet WMBusRTLWMBUS::getLinkModes()
+{
 
     return Any_bit;
 }
@@ -131,61 +133,80 @@ void WMBusRTLWMBUS::processSerialData()
 
     // Receive and accumulated serial data until a full frame has been received.
     serial_->receive(&data);
-
     read_buffer_.insert(read_buffer_.end(), data.begin(), data.end());
 
     size_t frame_length;
     int hex_payload_len, hex_payload_offset;
 
-    FrameStatus status = checkRTLWMBUSFrame(read_buffer_, &frame_length, &hex_payload_len, &hex_payload_offset);
+    for (;;)
+    {
+        FrameStatus status = checkRTLWMBUSFrame(read_buffer_, &frame_length, &hex_payload_len, &hex_payload_offset);
 
-    if (status == TextAndNotFrame) {
-        // The buffer has already been printed by serial cmd.
-        read_buffer_.clear();
-    } else
-    if (status == ErrorInFrame) {
-        debug("(rtlwmbus) error in received message.\n");
-        string msg = bin2hex(read_buffer_);
-        read_buffer_.clear();
-    } else
-    if (status == FullFrame) {
-        vector<uchar> payload;
-        if (hex_payload_len > 0) {
-            vector<uchar> hex;
-            hex.insert(hex.end(), read_buffer_.begin()+hex_payload_offset, read_buffer_.begin()+hex_payload_offset+hex_payload_len);
-            bool ok = hex2bin(hex, &payload);
-            if (!ok) {
-                if (hex.size() % 2 == 1) {
-                    payload.clear();
-                    warning("(rtlwmbus) warning: the hex string is not an even multiple of two! Dropping last char.\n");
-                    hex.pop_back();
-                    ok = hex2bin(hex, &payload);
-                }
-                if (!ok) {
-                    warning("(rtlwmbus) warning: the hex string contains bad characters! Decode stopped partway.\n");
+        if (status == PartialFrame)
+        {
+            break;
+        }
+        if (status == TextAndNotFrame)
+        {
+            // The buffer has already been printed by serial cmd.
+            read_buffer_.clear();
+            break;
+        }
+        if (status == ErrorInFrame)
+        {
+            debug("(rtlwmbus) error in received message.\n");
+            string msg = bin2hex(read_buffer_);
+            read_buffer_.clear();
+            break;
+        }
+        if (status == FullFrame)
+        {
+            vector<uchar> payload;
+            if (hex_payload_len > 0)
+            {
+                vector<uchar> hex;
+                hex.insert(hex.end(), read_buffer_.begin()+hex_payload_offset, read_buffer_.begin()+hex_payload_offset+hex_payload_len);
+                bool ok = hex2bin(hex, &payload);
+                if (!ok)
+                {
+                    if (hex.size() % 2 == 1)
+                    {
+                        payload.clear();
+                        warning("(rtlwmbus) warning: the hex string is not an even multiple of two! Dropping last char.\n");
+                        hex.pop_back();
+                        ok = hex2bin(hex, &payload);
+                    }
+                    if (!ok)
+                    {
+                        warning("(rtlwmbus) warning: the hex string contains bad characters! Decode stopped partway.\n");
+                    }
                 }
             }
-        }
 
-        read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
-        handleMessage(payload);
+            read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
+            handleMessage(payload);
+        }
     }
 }
 
 void WMBusRTLWMBUS::handleMessage(vector<uchar> &frame)
 {
     Telegram t;
-    t.parse(frame);
-    bool handled = false;
-    for (auto f : telegram_listeners_)
+    bool ok = t.parse(frame);
+
+    if (ok)
     {
-        Telegram copy = t;
-        if (f) f(&copy);
-        if (copy.handled) handled = true;
-    }
-    if (isVerboseEnabled() && !handled)
-    {
-        verbose("(rtlwmbus) telegram ignored by all configured meters!\n");
+        bool handled = false;
+        for (auto f : telegram_listeners_)
+        {
+            Telegram copy = t;
+            if (f) f(&copy);
+            if (copy.handled) handled = true;
+        }
+        if (isVerboseEnabled() && !handled)
+        {
+            verbose("(rtlwmbus) telegram ignored by all configured meters!\n");
+        }
     }
 }
 
@@ -194,7 +215,7 @@ FrameStatus WMBusRTLWMBUS::checkRTLWMBUSFrame(vector<uchar> &data,
                                               int *hex_payload_len_out,
                                               int *hex_payload_offset)
 {
-    //C1;1;1;2019-02-09 07:14:18.000;117;102;94740459;0x49449344590474943508780dff5f3500827f0000f10007b06effff530100005f2c620100007f2118010000008000800080008000000000000000000e003f005500d4ff2f046d10086922
+    // C1;1;1;2019-02-09 07:14:18.000;117;102;94740459;0x49449344590474943508780dff5f3500827f0000f10007b06effff530100005f2c620100007f2118010000008000800080008000000000000000000e003f005500d4ff2f046d10086922
     // There might be a second telegram on the same line ;0x4944.......
     if (data.size() == 0) return PartialFrame;
     int payload_len = 0;

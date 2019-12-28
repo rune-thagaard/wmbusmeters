@@ -1,3 +1,47 @@
+Version 0.9.20: 2019-12-11
+
+Added support for meterfilestimestamp
+to get the effect of log rotation of the meter files.
+
+Version 0.9.19: 2019-11-26
+
+Chester4444 added support for the nanoCUL usb stick. Thanks chester4444!
+Michal added a utility program (kem-import.py) to import KEM files. Thanks Michal!
+Added support for the Diehl HYDRUS watermeter.
+Added proper support for Multical302.
+
+Version 0.9.18: 2019-11-10
+
+Jacek added support for the Sappel/IZAR 868 meter. Thanks Jacek!
+
+Version 0.9.17: 2019-11-03
+
+Thanks to afl-fuzz I found and added
+some (in retrospect pretty obvious)
+missing checks to deal with
+corrupted telegrams that crashed
+wmbusmeters.
+
+Now afl-fuzz does not trigger any crash
+after running for a couple of minutes.
+Lets fuzz more....
+
+Version 0.9.16: 2019-11-03
+
+Significant rewrite of serial.cc.
+WMBusmeters can now specify stdin as <device>
+and continuously read wmbus frames from stdin.
+Either raw, or rtlwmbus formatted if stdin:rtlwmbus
+is supplied as the <device>. Check the README for
+more additions.
+
+Version 0.9.15: 2019-10-20
+
+Added Bmeter (rfmamb) and Lansen room sensors (lansenth).
+Added support for the rfmrx2 dongle.
+Added rawtty (eg /dev/ttyUSB0:38400) support for dongles
+that only transmit raw telegrams on the serial port.
+Added the ability to add static json data tailored for the meter.
 
 Version 0.9.14: 2019-09-16
 

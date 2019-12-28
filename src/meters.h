@@ -28,13 +28,18 @@
 #define LIST_OF_METERS \
     X(amiplus,    T1_bit, Electricity, AMIPLUS,     Amiplus)      \
     X(apator162,  C1_bit|T1_bit, Water,       APATOR162,   Apator162)    \
-    X(eurisii,    T1_bit, HeatCostAllocation, EURISII, EurisII) \
+    X(eurisii,    T1_bit, HeatCostAllocation, EURISII, EurisII)   \
     X(flowiq3100, C1_bit, Water,       FLOWIQ3100,  Multical21)   \
+    X(hydrus,     T1_bit, Water,       HYDRUS,      Hydrus)       \
+    X(hydrodigit, T1_bit, Water,       HYDRODIGIT,  Hydrodigit)   \
     X(iperl,      T1_bit, Water,       IPERL,       Iperl)        \
+    X(izar,       T1_bit, Water,       IZAR,        Izar)         \
+    X(lansenth,   T1_bit, TempHygro,   LANSENTH,    LansenTH)     \
     X(mkradio3,   T1_bit, Water,       MKRADIO3,    MKRadio3)     \
     X(multical21, C1_bit, Water,       MULTICAL21,  Multical21)   \
     X(multical302,C1_bit, Heat,        MULTICAL302, Multical302)  \
     X(omnipower,  C1_bit, Electricity, OMNIPOWER,   Omnipower)    \
+    X(rfmamb,     T1_bit, TempHygro,   RFMAMB,      RfmAmb)       \
     X(qcaloric,   C1_bit, HeatCostAllocation, QCALORIC, QCaloric) \
     X(supercom587,T1_bit, Water,       SUPERCOM587, Supercom587)  \
     X(vario451,   T1_bit, Heat,        VARIO451,    Vario451)     \
@@ -59,14 +64,16 @@ struct MeterInfo
     string key;
     LinkModeSet link_modes;
     vector<string> shells;
+    vector<string> jsons; // Additional static jsons that are added to each message.
 
-    MeterInfo(string n, string t, string i, string k, LinkModeSet lms, vector<string> &s)
+    MeterInfo(string n, string t, string i, string k, LinkModeSet lms, vector<string> &s, vector<string> &j)
     {
         name = n;
         type = t;
         id = i;
         key = k;
         shells = s;
+        jsons = j;
         link_modes = lms;
     }
 };
@@ -90,7 +97,8 @@ struct Meter
                             string *human_readable,
                             string *fields, char separator,
                             string *json,
-                            vector<string> *envs) = 0;
+                            vector<string> *envs,
+                            vector<string> *more_json) = 0;
 
     void handleTelegram(Telegram *t);
     virtual bool isTelegramForMe(Telegram *t) = 0;
@@ -152,6 +160,20 @@ struct HeatCostMeter : public virtual Meter {
     virtual double consumptionAtSetDate(Unit u);
 };
 
+struct TempMeter : public virtual Meter {
+    virtual double currentTemperature(Unit u) = 0; // °C
+    virtual ~TempMeter() = default;
+};
+
+struct HygroMeter : public virtual Meter {
+    virtual double currentRelativeHumidity() = 0; // RH
+    virtual ~HygroMeter() = default;
+};
+
+struct TempHygroMeter : public virtual TempMeter, public virtual HygroMeter {
+    virtual ~TempHygroMeter() = default;
+};
+
 struct GenericMeter : public virtual Meter {
 };
 
@@ -168,8 +190,13 @@ unique_ptr<WaterMeter> createSupercom587(WMBus *bus, MeterInfo &m);
 unique_ptr<WaterMeter> createMKRadio3(WMBus *bus, MeterInfo &m);
 unique_ptr<WaterMeter> createApator162(WMBus *bus, MeterInfo &m);
 unique_ptr<WaterMeter> createIperl(WMBus *bus, MeterInfo &m);
+unique_ptr<WaterMeter> createHydrus(WMBus *bus, MeterInfo &m);
+unique_ptr<WaterMeter> createHydrodigit(WMBus *bus, MeterInfo &m);
+unique_ptr<WaterMeter> createIzar(WMBus *bus, MeterInfo &m);
 unique_ptr<HeatCostMeter> createQCaloric(WMBus *bus, MeterInfo &m);
 unique_ptr<HeatCostMeter> createEurisII(WMBus *bus, MeterInfo &m);
+unique_ptr<TempHygroMeter> createLansenTH(WMBus *bus, MeterInfo &m);
+unique_ptr<TempHygroMeter> createRfmAmb(WMBus *bus, MeterInfo &m);
 GenericMeter *createGeneric(WMBus *bus, MeterInfo &m);
 
 #endif

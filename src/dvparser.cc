@@ -122,8 +122,10 @@ bool parseDV(Telegram *t,
         if (*format == format_end) break;
         uchar dif = **format;
 
+        MeasurementType mt = difMeasurementType(dif);
         int datalen = difLenBytes(dif);
-        DEBUG_PARSER("(dvparser debug) dif=%02x datalen=%d \"%s\"\n", dif, datalen, difType(dif).c_str());
+        DEBUG_PARSER("(dvparser debug) dif=%02x datalen=%d \"%s\" type=%s\n", dif, datalen, difType(dif).c_str(),
+                     measurementTypeName(mt).c_str());
         if (datalen == -2) {
             debug("(dvparser) cannot handle dif %02X ignoring rest of telegram.\n\n", dif);
             break;
@@ -249,7 +251,7 @@ bool parseDV(Telegram *t,
         }
         string value = bin2hex(data, data_end, datalen);
         int offset = start_parse_here+data-data_start;
-        (*values)[key] = { offset, DVEntry(vif&0x7f, storage_nr, tariff, subunit, value) };
+        (*values)[key] = { offset, DVEntry(mt, vif&0x7f, storage_nr, tariff, subunit, value) };
         if (value.length() > 0) {
             // This call increments data with datalen.
             t->addExplanation(data, datalen, "%s", value.c_str());
@@ -288,19 +290,29 @@ bool hasKey(std::map<std::string,std::pair<int,DVEntry>> *values, std::string ke
     return values->count(key) > 0;
 }
 
-bool findKey(ValueInformation vif, int storagenr, std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values)
+bool findKey(MeasurementType mit, ValueInformation vif, int storagenr, std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values)
 {
     int low, hi;
     valueInfoRange(vif, &low, &hi);
 
+    debug("(dvparser) looking for type=%s vif=%s storagenr=%d\n",
+          measurementTypeName(mit).c_str(), ValueInformationName(vif), storagenr);
+
     for (auto& v : *values)
     {
+        MeasurementType ty = v.second.second.type;
         int vi = v.second.second.value_information;
         int sn = v.second.second.storagenr;
-        if (vi >= low && vi <= hi && (storagenr == ANY_STORAGENR || storagenr == sn)) {
+        debug("(dvparser) match? type=%s vif=%s and storagenr=%d\n",
+              measurementTypeName(ty).c_str(), ValueInformationName(vif), storagenr, sn);
+
+        if (vi >= low && vi <= hi
+            && (mit == MeasurementType::Unknown || mit == ty)
+            && (storagenr == ANY_STORAGENR || storagenr == sn))
+        {
             *key = v.first;
-            debug("(dvparser) found key %s for %s and storagenr=%d\n",
-                  v.first.c_str(), ValueInformationName(vif), storagenr);
+            debug("(dvparser) found key %s for type=%s vif=%s storagenr=%d\n",
+                  v.first.c_str(), measurementTypeName(ty).c_str(), ValueInformationName(vif), storagenr);
             return true;
         }
     }
@@ -326,6 +338,29 @@ void extractDV(string &s, uchar *dif, uchar *vif)
     }
 
     *vif = bytes[i];
+}
+
+bool extractDVuint8(map<string,pair<int,DVEntry>> *values,
+                    string key,
+                    int *offset,
+                    uchar *value)
+{
+    if ((*values).count(key) == 0) {
+        verbose("(dvparser) warning: cannot extract uint16 from non-existant key \"%s\"\n", key.c_str());
+        *offset = -1;
+        *value = 0;
+        return false;
+    }
+    uchar dif, vif;
+    extractDV(key, &dif, &vif);
+
+    pair<int,DVEntry>&  p = (*values)[key];
+    *offset = p.first;
+    vector<uchar> v;
+    hex2bin(p.second.value, &v);
+
+    *value = v[0];
+    return true;
 }
 
 bool extractDVuint16(map<string,pair<int,DVEntry>> *values,
@@ -354,7 +389,8 @@ bool extractDVuint16(map<string,pair<int,DVEntry>> *values,
 bool extractDVdouble(map<string,pair<int,DVEntry>> *values,
                      string key,
                      int *offset,
-                     double *value)
+                     double *value,
+                     bool auto_scale)
 {
     if ((*values).count(key) == 0) {
         verbose("(dvparser) warning: cannot extract double from non-existant key \"%s\"\n", key.c_str());
@@ -402,7 +438,8 @@ bool extractDVdouble(map<string,pair<int,DVEntry>> *values,
                 + ((unsigned int)v[1])*256
                 + ((unsigned int)v[0]);
         }
-        double scale = vifScale(vif);
+        double scale = 1.0;
+        if (auto_scale) scale = vifScale(vif);
         *value = ((double)raw) / scale;
     }
     else
@@ -443,7 +480,8 @@ bool extractDVdouble(map<string,pair<int,DVEntry>> *values,
                 + (v[0]-'0')*10 + (v[1]-'0');
         }
 
-        double scale = vifScale(vif);
+        double scale = 1.0;
+        if (auto_scale) scale = vifScale(vif);
         *value = ((double)raw) / scale;
     }
     else

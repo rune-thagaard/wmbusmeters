@@ -116,6 +116,15 @@ enum class EncryptionMode
     AES_CTR
 };
 
+enum class MeasurementType
+{
+    Unknown,
+    Instantaneous,
+    Minimum,
+    Maximum,
+    AtError
+};
+
 using namespace std;
 
 struct Telegram {
@@ -155,7 +164,7 @@ struct Telegram {
     bool handled {}; // Set to true, when a meter has accepted the telegram.
 
 
-    void parse(vector<uchar> &payload);
+    bool parse(vector<uchar> &payload);
     void print();
     void verboseFields();
 
@@ -193,7 +202,7 @@ struct WMBus {
     virtual ~WMBus() = 0;
 };
 
-#define LIST_OF_MBUS_DEVICES X(DEVICE_IM871A)X(DEVICE_AMB8465)X(DEVICE_SIMULATOR)X(DEVICE_RTLWMBUS)X(DEVICE_UNKNOWN)
+#define LIST_OF_MBUS_DEVICES X(DEVICE_CUL)X(DEVICE_IM871A)X(DEVICE_AMB8465)X(DEVICE_RFMRX2)X(DEVICE_SIMULATOR)X(DEVICE_RTLWMBUS)X(DEVICE_RAWTTY)X(DEVICE_UNKNOWN)
 
 enum MBusDeviceType {
 #define X(name) name,
@@ -201,18 +210,32 @@ LIST_OF_MBUS_DEVICES
 #undef X
 };
 
-// The detect function can be supplied the device "auto" and will try default locations for the device.
-// Returned is the type and the found device string.
-pair<MBusDeviceType,string> detectMBusDevice(string device, SerialCommunicationManager *manager);
+struct Detected
+{
+    MBusDeviceType type;  // IM871A, AMB8465 etc
+    string devicefile;    // /dev/ttyUSB0 /dev/ttyACM0 stdin simulation_abc.txt telegrams.raw
+    int baudrate;         // If the suffix is a number, store the number here.
+    // If the override_tty is true, then do not allow the wmbus driver to open the tty,
+    // instead open the devicefile first. This is to allow feeding the wmbus drivers using stdin
+    // or a file or for internal testing.
+    bool override_tty;
+};
 
-unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager);
-unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager, SerialDevice *serial);
-unique_ptr<WMBus> openAMB8465(string device, SerialCommunicationManager *manager);
-unique_ptr<WMBus> openAMB8465(string device, SerialCommunicationManager *manager, SerialDevice *serial);
-struct WMBusSimulator;
-unique_ptr<WMBus> openRTLWMBUS(string device, SerialCommunicationManager *manager, std::function<void()> on_exit);
-unique_ptr<WMBus> openRTLWMBUS(string device, SerialCommunicationManager *manager, SerialDevice *serial, std::function<void()> on_exit);
-unique_ptr<WMBus> openSimulator(string file, SerialCommunicationManager *manager);
+Detected detectWMBusDeviceSetting(string devicefile, string suffix,
+                                  SerialCommunicationManager *manager);
+
+unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager,
+                             unique_ptr<SerialDevice> serial_override);
+unique_ptr<WMBus> openAMB8465(string device, SerialCommunicationManager *manager,
+                              unique_ptr<SerialDevice> serial_override);
+unique_ptr<WMBus> openRawTTY(string device, int baudrate, SerialCommunicationManager *manager,
+                             unique_ptr<SerialDevice> serial_override);
+unique_ptr<WMBus> openRTLWMBUS(string device, SerialCommunicationManager *manager, std::function<void()> on_exit,
+                               unique_ptr<SerialDevice> serial_override);
+unique_ptr<WMBus> openCUL(string device, SerialCommunicationManager *manager,
+                              unique_ptr<SerialDevice> serial_override);
+unique_ptr<WMBus> openSimulator(string file, SerialCommunicationManager *manager,
+                                unique_ptr<SerialDevice> serial_override);
 
 string manufacturer(int m_field);
 string manufacturerFlag(int m_field);
@@ -234,7 +257,9 @@ double extract16bitAsDouble(int dif, int vif, int vife, string data);
 double extract32bitAsDouble(int dif, int vif, int vife, string data);
 
 int difLenBytes(int dif);
+MeasurementType difMeasurementType(int dif);
 
 string linkModeName(LinkMode link_mode);
+string measurementTypeName(MeasurementType mt);
 
 #endif

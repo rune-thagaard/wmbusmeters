@@ -50,10 +50,11 @@ void parseMeterConfig(Configuration *c, vector<char> &buf, string file)
     string key;
     string linkmodes;
     vector<string> shells;
+    vector<string> jsons;
 
     debug("(config) loading meter file %s\n", file.c_str());
     for (;;) {
-        auto p = getNextKeyValue(buf, i);
+        pair<string,string> p = getNextKeyValue(buf, i);
 
         if (p.first == "") break;
 
@@ -63,13 +64,20 @@ void parseMeterConfig(Configuration *c, vector<char> &buf, string file)
         else
         if (p.first == "id") id = p.second;
         else
-        if (p.first == "key") {
+        if (p.first == "key")
+        {
             key = p.second;
             debug("(config) key=<notprinted>\n");
         }
         else
         if (p.first == "shell") {
             shells.push_back(p.second);
+        }
+        else
+        if (startsWith(p.first, "json_"))
+        {
+            string keyvalue = p.first.substr(5)+"="+p.second;
+            jsons.push_back(keyvalue);
         }
         else
             warning("Found invalid key \"%s\" in meter config file\n", p.first.c_str());
@@ -116,16 +124,16 @@ void parseMeterConfig(Configuration *c, vector<char> &buf, string file)
         warning("Not a valid meter type \"%s\"\n", type.c_str());
         use = false;
     }
-    if (!isValidMatchExpressions(id, false)) {
+    if (!isValidMatchExpressions(id, true)) {
         warning("Not a valid meter id nor a valid meter match expression \"%s\"\n", id.c_str());
         use = false;
     }
-    if (!isValidKey(key)) {
+    if (!isValidKey(key, mt)) {
         warning("Not a valid meter key \"%s\"\n", key.c_str());
         use = false;
     }
     if (use) {
-        c->meters.push_back(MeterInfo(name, type, id, key, modes, shells));
+        c->meters.push_back(MeterInfo(name, type, id, key, modes, shells, jsons));
     }
 
     return;
@@ -166,16 +174,17 @@ void handleDevice(Configuration *c, string device)
 
 void handleListenTo(Configuration *c, string mode)
 {
-    LinkMode lm = isLinkMode(mode.c_str());
-    if (lm == LinkMode::UNKNOWN) {
+    LinkModeSet lms = parseLinkModes(mode.c_str());
+    if (lms.bits() == 0) {
         error("Unknown link mode \"%s\"!\n", mode.c_str());
     }
     if (c->link_mode_configured) {
         error("You have already specified a link mode!\n");
     }
-    c->listen_to_link_modes.addLinkMode(lm);
+    c->listen_to_link_modes = lms;
     c->link_mode_configured = true;
 }
+
 void handleLogtelegrams(Configuration *c, string logtelegrams)
 {
     if (logtelegrams == "true") { c->logtelegrams = true; }
@@ -230,6 +239,34 @@ void handleMeterfilesNaming(Configuration *c, string type)
     }
 }
 
+void handleMeterfilesTimestamp(Configuration *c, string type)
+{
+    if (type == "day")
+    {
+        c->meterfiles_timestamp = MeterFileTimestamp::Day;
+    }
+    else if (type == "hour")
+    {
+        c->meterfiles_timestamp = MeterFileTimestamp::Hour;
+    }
+    else if (type == "minute")
+    {
+        c->meterfiles_timestamp = MeterFileTimestamp::Minute;
+    }
+    else if (type == "micros")
+    {
+        c->meterfiles_timestamp = MeterFileTimestamp::Micros;
+    }
+    else if (type == "never")
+    {
+        c->meterfiles_timestamp = MeterFileTimestamp::Never;
+    }
+    else
+    {
+        warning("No such meter file timestamp \"%s\"\n", type.c_str());
+    }
+}
+
 void handleLogfile(Configuration *c, string logfile)
 {
     if (logfile.length() > 0)
@@ -257,6 +294,22 @@ void handleFormat(Configuration *c, string format)
         c->separator = ';';
     } else {
         warning("Unknown output format: \"%s\"\n", format.c_str());
+    }
+}
+
+void handleReopenAfter(Configuration *c, string s)
+{
+    if (s.length() >= 1)
+    {
+        c->reopenafter = parseTime(s.c_str());
+        if (c->reopenafter <= 0)
+        {
+            warning("Not a valid time to reopen after. \"%s\"\n", s.c_str());
+        }
+    }
+    else
+    {
+        warning("Reopen after must be a valid number of seconds.\n");
     }
 }
 
@@ -291,6 +344,11 @@ void handleShell(Configuration *c, string cmdline)
     c->shells.push_back(cmdline);
 }
 
+void handleJson(Configuration *c, string json)
+{
+    c->jsons.push_back(json);
+}
+
 unique_ptr<Configuration> loadConfiguration(string root)
 {
     Configuration *c = new Configuration;
@@ -317,11 +375,19 @@ unique_ptr<Configuration> loadConfiguration(string root)
         else if (p.first == "meterfiles") handleMeterfiles(c, p.second);
         else if (p.first == "meterfilesaction") handleMeterfilesAction(c, p.second);
         else if (p.first == "meterfilesnaming") handleMeterfilesNaming(c, p.second);
+        else if (p.first == "meterfilestimestamp") handleMeterfilesTimestamp(c, p.second);
         else if (p.first == "logfile") handleLogfile(c, p.second);
         else if (p.first == "format") handleFormat(c, p.second);
+        else if (p.first == "reopenafter") handleReopenAfter(c, p.second);
         else if (p.first == "separator") handleSeparator(c, p.second);
         else if (p.first == "addconversions") handleConversions(c, p.second);
         else if (p.first == "shell") handleShell(c, p.second);
+        else if (startsWith(p.first, "json_"))
+        {
+            string s = p.first.substr(5);
+            string keyvalue = s+"="+p.second;
+            handleJson(c, keyvalue);
+        }
         else
         {
             warning("No such key: %s\n", p.first.c_str());
@@ -362,7 +428,6 @@ LinkModeCalculationResult calculateLinkModes(Configuration *config, WMBus *wmbus
     }
     string metersu = meters_union.hr();
     debug("(config) all possible link modes that the meters might transmit on: %s\n", metersu.c_str());
-
     if (meters_union.bits() == 0) {
         if (!config->link_mode_configured)
         {

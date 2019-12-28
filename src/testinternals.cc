@@ -39,6 +39,8 @@ int main(int argc, char **argv)
         // Supply --debug (oh well, anything works) to enable debug mode.
         debugEnabled(true);
     }
+    onExit([](){});
+
     test_crc();
     test_dvparser();
     test_linkmodes();
@@ -198,15 +200,20 @@ int test_dvparser()
 int test_linkmodes()
 {
     LinkModeCalculationResult lmcr;
-    auto manager = createSerialCommunicationManager(0);
+    auto manager = createSerialCommunicationManager(0, 0, false);
+
     auto serial1 = manager->createSerialDeviceSimulator();
     auto serial2 = manager->createSerialDeviceSimulator();
     auto serial3 = manager->createSerialDeviceSimulator();
-    vector<string> no_meter_shells;
+    auto serial4 = manager->createSerialDeviceSimulator();
 
-    unique_ptr<WMBus> wmbus_im871a = openIM871A("", manager.get(), serial1.release());
-    unique_ptr<WMBus> wmbus_amb8465 = openAMB8465("", manager.get(), serial2.release());
-    unique_ptr<WMBus> wmbus_rtlwmbus = openRTLWMBUS("", manager.get(), serial3.release(), [](){});
+    vector<string> no_meter_shells, no_meter_jsons;
+
+    unique_ptr<WMBus> wmbus_im871a = openIM871A("", manager.get(), std::move(serial1));
+
+    unique_ptr<WMBus> wmbus_amb8465 = openAMB8465("", manager.get(), std::move(serial2));
+    unique_ptr<WMBus> wmbus_rtlwmbus = openRTLWMBUS("", manager.get(), [](){}, std::move(serial3));
+    unique_ptr<WMBus> wmbus_rawtty = openRawTTY("", 0, manager.get(), std::move(serial4));
 
     Configuration nometers_config;
     // Check that if no meters are supplied then you must set a link mode.
@@ -231,7 +238,8 @@ int test_linkmodes()
     string apator162 = "apator162";
     apator_config.meters.push_back(MeterInfo("m1", apator162, "12345678", "",
                                              toMeterLinkModeSet(apator162),
-                                             no_meter_shells));
+                                             no_meter_shells,
+                                             no_meter_jsons));
 
     // Check that if no explicit link modes are provided to apator162, then
     // automatic deduction will fail, since apator162 can be configured to transmit
@@ -269,10 +277,12 @@ int test_linkmodes()
     string supercom587 = "supercom587";
     multical21_and_supercom587_config.meters.push_back(MeterInfo("m1", multical21, "12345678", "",
                                                                  toMeterLinkModeSet(multical21),
-                                                                 no_meter_shells));
+                                                                 no_meter_shells,
+                                                                 no_meter_jsons));
     multical21_and_supercom587_config.meters.push_back(MeterInfo("m2", supercom587, "12345678", "",
                                                                  toMeterLinkModeSet(supercom587),
-                                                                 no_meter_shells));
+                                                                 no_meter_shells,
+                                                                 no_meter_jsons));
 
     // Check that meters that transmit on two different link modes cannot be listened to
     // at the same time using im871a.
@@ -384,4 +394,20 @@ void test_ids()
 
     test_does_id_match_expression("78563413", "78563412,78563413", true);
     test_does_id_match_expression("78563413", "*,!00156327,!00048713", true);
+}
+
+void eq(string a, string b, const char *tn)
+{
+    if (a != b)
+    {
+        printf("ERROR in test %s expected \"%s\" to be equal to \"%s\"\n", tn, a.c_str(), b.c_str());
+    }
+}
+
+void eqn(int a, int b, const char *tn)
+{
+    if (a != b)
+    {
+        printf("ERROR in test %s expected %d to be equal to %d\n", tn, a, b);
+    }
 }

@@ -16,6 +16,7 @@
 */
 
 #include"util.h"
+#include"meters.h"
 #include<dirent.h>
 #include<functional>
 #include<grp.h>
@@ -27,6 +28,7 @@
 #include<string>
 #include<sys/errno.h>
 #include<sys/stat.h>
+#include<sys/time.h>
 #include<syslog.h>
 #include<unistd.h>
 #include<sys/types.h>
@@ -35,14 +37,14 @@
 using namespace std;
 
 // Sigint, sigterm will call the exit handler.
-function<void()> exit_handler;
+function<void()> exit_handler_;
 
 bool got_hupped_ {};
 
 void exitHandler(int signum)
 {
     got_hupped_ = signum == SIGHUP;
-    if (exit_handler) exit_handler();
+    if (exit_handler_) exit_handler_();
 }
 
 bool gotHupped()
@@ -63,16 +65,20 @@ void doNothing(int signum)
 
 void signalMyself(int signum)
 {
-    if (wake_me_up_on_sig_chld_) {
-        pthread_kill(wake_me_up_on_sig_chld_, SIGUSR1);
+    if (wake_me_up_on_sig_chld_)
+    {
+        if (signalsInstalled())
+        {
+            pthread_kill(wake_me_up_on_sig_chld_, SIGUSR1);
+        }
     }
 }
 
-struct sigaction old_int, old_hup, old_term, old_chld, old_usr1;
+struct sigaction old_int, old_hup, old_term, old_chld, old_usr1, old_usr2;
 
 void onExit(function<void()> cb)
 {
-    exit_handler = cb;
+    exit_handler_ = cb;
     struct sigaction new_action;
 
     new_action.sa_handler = exitHandler;
@@ -81,28 +87,39 @@ void onExit(function<void()> cb)
 
     sigaction(SIGINT, &new_action, &old_int);
     sigaction(SIGHUP, &new_action, &old_hup);
-    sigaction (SIGTERM, &new_action, &old_term);
+    sigaction(SIGTERM, &new_action, &old_term);
 
     new_action.sa_handler = signalMyself;
     sigemptyset (&new_action.sa_mask);
     new_action.sa_flags = 0;
-    sigaction (SIGCHLD, &new_action, &old_chld);
+    sigaction(SIGCHLD, &new_action, &old_chld);
 
     new_action.sa_handler = doNothing;
     sigemptyset (&new_action.sa_mask);
     new_action.sa_flags = 0;
     sigaction(SIGUSR1, &new_action, &old_usr1);
+
+    new_action.sa_handler = doNothing;
+    sigemptyset (&new_action.sa_mask);
+    new_action.sa_flags = 0;
+    sigaction(SIGUSR2, &new_action, &old_usr2);
+}
+
+bool signalsInstalled()
+{
+    return exit_handler_ != NULL;
 }
 
 void restoreSignalHandlers()
 {
-    exit_handler = NULL;
+    exit_handler_ = NULL;
 
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGHUP, &old_hup, NULL);
     sigaction(SIGTERM, &old_term, NULL);
     sigaction(SIGCHLD, &old_chld, NULL);
     sigaction(SIGUSR1, &old_usr1, NULL);
+    sigaction(SIGUSR2, &old_usr2, NULL);
 }
 
 int char2int(char input)
@@ -530,10 +547,11 @@ bool doesIdMatchExpressions(string& id, vector<string>& mes)
     return false;
 }
 
-bool isValidKey(string& key)
+bool isValidKey(string& key, MeterType mt)
 {
     if (key.length() == 0) return true;
-    if (key.length() != 32) return false;
+    if ((mt == MeterType::IZAR && key.length() != 16) ||
+        (mt != MeterType::IZAR && key.length() != 32)) return false;
     vector<uchar> tmp;
     return hex2bin(key, &tmp);
 }
@@ -545,6 +563,16 @@ bool isFrequency(std::string& fq)
     if (fq[len-1] == 'M') len--;
     for (int i=0; i<len; ++i) {
         if (!isdigit(fq[i]) && fq[i] != '.') return false;
+    }
+    return true;
+}
+
+bool isNumber(std::string& fq)
+{
+    int len = fq.length();
+    if (len == 0) return false;
+    for (int i=0; i<len; ++i) {
+        if (!isdigit(fq[i])) return false;
     }
     return true;
 }
@@ -602,7 +630,7 @@ bool checkCharacterDeviceExists(const char *tty, bool fail_if_not)
     return true;
 }
 
-bool checkIfSimulationFile(const char *file)
+bool checkFileExists(const char *file)
 {
     struct stat info;
 
@@ -611,6 +639,15 @@ bool checkIfSimulationFile(const char *file)
         return false;
     }
     if (!S_ISREG(info.st_mode)) {
+        return false;
+    }
+    return true;
+}
+
+bool checkIfSimulationFile(const char *file)
+{
+    if (!checkFileExists(file))
+    {
         return false;
     }
     const char *filename = strrchr(file, '/');
@@ -956,4 +993,78 @@ int countSetBits(int v)
         n++;
     }
     return n;
+}
+
+bool startsWith(string &s, const char *prefix)
+{
+    size_t len = strlen(prefix);
+    if (s.length() < len) return false;
+    if (s.length() == len) return s == prefix;
+    return !strncmp(&s[0], prefix, len);
+}
+
+string makeQuotedJson(string &s)
+{
+    size_t p = s.find('=');
+    string key, value;
+    if (p != string::npos)
+    {
+        key = s.substr(0,p);
+        value = s.substr(p+1);
+    }
+    else
+    {
+        key = s;
+        value = "";
+    }
+
+    return string("\"")+key+"\":\""+value+"\"";
+}
+
+string currentDay()
+{
+    char datetime[40];
+    memset(datetime, 0, sizeof(datetime));
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    strftime(datetime, 20, "%Y-%m-%d", localtime(&tv.tv_sec));
+    return string(datetime);
+}
+
+string currentHour()
+{
+    char datetime[40];
+    memset(datetime, 0, sizeof(datetime));
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    strftime(datetime, 20, "%Y-%m-%d_%H", localtime(&tv.tv_sec));
+    return string(datetime);
+}
+
+string currentMinute()
+{
+    char datetime[40];
+    memset(datetime, 0, sizeof(datetime));
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    strftime(datetime, 20, "%Y-%m-%d_%H:%M", localtime(&tv.tv_sec));
+    return string(datetime);
+}
+
+string currentMicros()
+{
+    char datetime[40];
+    memset(datetime, 0, sizeof(datetime));
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    strftime(datetime, 20, "%Y-%m-%d_%H:%M:%S", localtime(&tv.tv_sec));
+    return string(datetime)+"."+to_string(tv.tv_usec);
 }

@@ -29,7 +29,8 @@ using namespace std;
 
 enum FrameStatus { PartialFrame, FullFrame, ErrorInFrame };
 
-struct WMBusIM871A : public WMBus {
+struct WMBusIM871A : public WMBus
+{
     bool ping();
     uint32_t getDeviceId();
     LinkModeSet getLinkModes();
@@ -48,8 +49,8 @@ struct WMBusIM871A : public WMBus {
             N1f_bit;
     }
     int numConcurrentLinkModes() { return 1; }
-    bool canSetLinkModes(LinkModeSet lms) {
-
+    bool canSetLinkModes(LinkModeSet lms)
+    {
         if (0 == countSetBits(lms.bits())) return false;
         if (!supportedLinkModes().supports(lms)) return false;
         // Ok, the supplied link modes are compatible,
@@ -75,11 +76,12 @@ private:
     int received_command_ {};
     vector<uchar> received_payload_;
     vector<function<void(Telegram*)>> telegram_listeners_;
+    LinkModeSet link_modes_ {};
 
     void waitForResponse();
-    static FrameStatus checkFrame(vector<uchar> &data,
-                           size_t *frame_length, int *endpoint_out, int *msgid_out,
-                           int *payload_len_out, int *payload_offset);
+    static FrameStatus checkIM871AFrame(vector<uchar> &data,
+                                        size_t *frame_length, int *endpoint_out, int *msgid_out,
+                                        int *payload_len_out, int *payload_offset);
     friend bool detectIM871A(string device, SerialCommunicationManager *manager);
     void handleDevMgmt(int msgid, vector<uchar> &payload);
     void handleRadioLink(int msgid, vector<uchar> &payload);
@@ -87,16 +89,16 @@ private:
     void handleHWTest(int msgid, vector<uchar> &payload);
 };
 
-unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager)
+unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager, unique_ptr<SerialDevice> serial_override)
 {
+    if (serial_override)
+    {
+        WMBusIM871A *imp = new WMBusIM871A(std::move(serial_override), manager);
+        return unique_ptr<WMBus>(imp);
+    }
+
     auto serial = manager->createSerialDeviceTTY(device.c_str(), 57600);
     WMBusIM871A *imp = new WMBusIM871A(std::move(serial), manager);
-    return unique_ptr<WMBus>(imp);
-}
-
-unique_ptr<WMBus> openIM871A(string device, SerialCommunicationManager *manager, SerialDevice *serial)
-{
-    WMBusIM871A *imp = new WMBusIM871A(unique_ptr<SerialDevice>(serial), manager);
     return unique_ptr<WMBus>(imp);
 }
 
@@ -108,7 +110,8 @@ WMBusIM871A::WMBusIM871A(unique_ptr<SerialDevice> serial, SerialCommunicationMan
     serial_->open(true);
 }
 
-bool WMBusIM871A::ping() {
+bool WMBusIM871A::ping()
+{
     pthread_mutex_lock(&command_lock_);
 
     vector<uchar> msg(4);
@@ -119,15 +122,16 @@ bool WMBusIM871A::ping() {
 
     sent_command_ = DEVMGMT_MSG_PING_REQ;
     verbose("(im871a) ping\n");
-    serial()->send(msg);
+    bool sent = serial()->send(msg);
 
-    waitForResponse();
+    if (sent) waitForResponse();
 
     pthread_mutex_unlock(&command_lock_);
     return true;
 }
 
-uint32_t WMBusIM871A::getDeviceId() {
+uint32_t WMBusIM871A::getDeviceId()
+{
     pthread_mutex_lock(&command_lock_);
 
     vector<uchar> msg(4);
@@ -138,28 +142,37 @@ uint32_t WMBusIM871A::getDeviceId() {
 
     sent_command_ = DEVMGMT_MSG_GET_DEVICEINFO_REQ;
     verbose("(im871a) get device info\n");
-    serial()->send(msg);
-
-    waitForResponse();
+    bool sent = serial()->send(msg);
 
     uint32_t id = 0;
-    if (received_command_ == DEVMGMT_MSG_GET_DEVICEINFO_RSP) {
-        verbose("(im871a) device info: module Type %02x\n", received_payload_[0]);
-        verbose("(im871a) device info: device Mode %02x\n", received_payload_[1]);
-        verbose("(im871a) device info: firmware version %02x\n", received_payload_[2]);
-        verbose("(im871a) device info: hci protocol version %02x\n", received_payload_[3]);
-        id = received_payload_[4] << 24 |
-            received_payload_[5] << 16 |
-            received_payload_[6] << 8 |
-            received_payload_[7];
-        verbose("(im871a) devince info: id %08x\n", id);
+
+    if (sent)
+    {
+        waitForResponse();
+
+        if (received_command_ == DEVMGMT_MSG_GET_DEVICEINFO_RSP) {
+            verbose("(im871a) device info: module Type %02x\n", received_payload_[0]);
+            verbose("(im871a) device info: device Mode %02x\n", received_payload_[1]);
+            verbose("(im871a) device info: firmware version %02x\n", received_payload_[2]);
+            verbose("(im871a) device info: hci protocol version %02x\n", received_payload_[3]);
+            id = received_payload_[4] << 24 |
+                received_payload_[5] << 16 |
+                received_payload_[6] << 8 |
+                received_payload_[7];
+            verbose("(im871a) devince info: id %08x\n", id);
+        }
+    }
+    else
+    {
+        id = 0;
     }
 
     pthread_mutex_unlock(&command_lock_);
     return id;
 }
 
-LinkModeSet WMBusIM871A::getLinkModes() {
+LinkModeSet WMBusIM871A::getLinkModes()
+{
     pthread_mutex_lock(&command_lock_);
 
     vector<uchar> msg(4);
@@ -169,11 +182,19 @@ LinkModeSet WMBusIM871A::getLinkModes() {
     msg[3] = 0;
 
     verbose("(im871a) get config\n");
-    serial()->send(msg);
+    bool sent = serial()->send(msg);
+
+    if (!sent)
+    {
+        pthread_mutex_unlock(&command_lock_);
+        // Use the remembered link modes set before.
+        return link_modes_;
+    }
 
     waitForResponse();
     LinkMode lm = LinkMode::UNKNOWN;
-    if (received_command_ == DEVMGMT_MSG_GET_CONFIG_RSP) {
+    if (received_command_ == DEVMGMT_MSG_GET_CONFIG_RSP)
+    {
         int iff1 = received_payload_[0];
         bool has_device_mode = (iff1&1)==1;
         bool has_link_mode = (iff1&2)==2;
@@ -185,11 +206,13 @@ LinkModeSet WMBusIM871A::getLinkModes() {
         bool has_radio_channel = (iff1&128)==128;
 
         int offset = 1;
-        if (has_device_mode) {
+        if (has_device_mode)
+        {
             verbose("(im871a) config: device mode %02x\n", received_payload_[offset]);
             offset++;
         }
-        if (has_link_mode) {
+        if (has_link_mode)
+        {
             verbose("(im871a) config: link mode %02x\n", received_payload_[offset]);
             if (received_payload_[offset] == (int)LinkModeIM871A::C1a) {
                 lm = LinkMode::C1;
@@ -342,15 +365,17 @@ void WMBusIM871A::setLinkModes(LinkModeSet lms)
         msg[6] = (int)LinkModeIM871A::C1a; // Defaults to C1a
     }
 
-
     msg[7] = 16+32; // iff2 bits: Set rssi+timestamp
     msg[8] = 1;  // Enable rssi
     msg[9] = 1;  // Enable timestamp
 
     verbose("(im871a) set link mode %02x\n", msg[6]);
-    serial()->send(msg);
+    bool sent = serial()->send(msg);
 
-    waitForResponse();
+    if (sent) waitForResponse();
+
+    // Remember the link modes, necessary when using stdin or file.
+    link_modes_ = lms;
     pthread_mutex_unlock(&command_lock_);
 }
 
@@ -369,9 +394,9 @@ void WMBusIM871A::waitForResponse() {
     }
 }
 
-FrameStatus WMBusIM871A::checkFrame(vector<uchar> &data,
-                                    size_t *frame_length, int *endpoint_out, int *msgid_out,
-                                    int *payload_len_out, int *payload_offset)
+FrameStatus WMBusIM871A::checkIM871AFrame(vector<uchar> &data,
+                                          size_t *frame_length, int *endpoint_out, int *msgid_out,
+                                          int *payload_len_out, int *payload_offset)
 {
     if (data.size() == 0) return PartialFrame;
     if (data[0] != 0xa5) return ErrorInFrame;
@@ -448,41 +473,48 @@ void WMBusIM871A::processSerialData()
     int msgid;
     int payload_len, payload_offset;
 
-    FrameStatus status = checkFrame(read_buffer_, &frame_length, &endpoint, &msgid, &payload_len, &payload_offset);
+    for (;;)
+    {
+        FrameStatus status = checkIM871AFrame(read_buffer_, &frame_length, &endpoint, &msgid, &payload_len, &payload_offset);
 
-    if (status == ErrorInFrame) {
-        verbose("(im871a) protocol error in message received!\n");
-        string msg = bin2hex(read_buffer_);
-        debug("(im871a) protocol error \"%s\"\n", msg.c_str());
-        read_buffer_.clear();
-    }
-    else
-    if (status == FullFrame) {
-
-        vector<uchar> payload;
-        if (payload_len > 0)
+        if (status == PartialFrame)
         {
-            if (endpoint == RADIOLINK_ID &&
-                msgid == RADIOLINK_MSG_WMBUSMSG_IND)
-            {
-                uchar l = payload_len;
-                payload.insert(payload.begin(), &l, &l+1); // Re-insert the len byte.
-            }
-            // Insert the payload.
-            payload.insert(payload.end(),
-                           read_buffer_.begin()+payload_offset,
-                           read_buffer_.begin()+payload_offset+payload_len);
+            break;
         }
+        if (status == ErrorInFrame)
+        {
+            verbose("(im871a) protocol error in message received!\n");
+            string msg = bin2hex(read_buffer_);
+            debug("(im871a) protocol error \"%s\"\n", msg.c_str());
+            read_buffer_.clear();
+            break;
+        }
+        if (status == FullFrame)
+        {
+            vector<uchar> payload;
+            if (payload_len > 0)
+            {
+                if (endpoint == RADIOLINK_ID &&
+                    msgid == RADIOLINK_MSG_WMBUSMSG_IND)
+                {
+                    uchar l = payload_len;
+                    payload.insert(payload.begin(), &l, &l+1); // Re-insert the len byte.
+                }
+                // Insert the payload.
+                payload.insert(payload.end(),
+                               read_buffer_.begin()+payload_offset,
+                               read_buffer_.begin()+payload_offset+payload_len);
+            }
+            read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
 
-        read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
-
-        // We now have a proper message in payload. Let us trigger actions based on it.
-        // It can be wmbus receiver-dongle messages or wmbus remote meter messages received over the radio.
-        switch (endpoint) {
-        case DEVMGMT_ID: handleDevMgmt(msgid, payload); break;
-        case RADIOLINK_ID: handleRadioLink(msgid, payload); break;
-        case RADIOLINKTEST_ID: handleRadioLinkTest(msgid, payload); break;
-        case HWTEST_ID: handleHWTest(msgid, payload); break;
+            // We now have a proper message in payload. Let us trigger actions based on it.
+            // It can be wmbus receiver-dongle messages or wmbus remote meter messages received over the radio.
+            switch (endpoint) {
+            case DEVMGMT_ID: handleDevMgmt(msgid, payload); break;
+            case RADIOLINK_ID: handleRadioLink(msgid, payload); break;
+            case RADIOLINKTEST_ID: handleRadioLinkTest(msgid, payload); break;
+            case HWTEST_ID: handleHWTest(msgid, payload); break;
+            }
         }
     }
 }
@@ -527,17 +559,20 @@ void WMBusIM871A::handleRadioLink(int msgid, vector<uchar> &payload)
         case RADIOLINK_MSG_WMBUSMSG_IND: // 0x03
             {
                 Telegram t;
-                t.parse(payload);
-                bool handled = false;
-
-                for (auto f : telegram_listeners_) {
-                    Telegram copy = t;
-                    if (f) f(&copy);
-                    if (copy.handled) handled = true;
-                }
-                if (isVerboseEnabled() && !handled)
+                bool ok = t.parse(payload);
+                if (ok)
                 {
-                    verbose("(im871a) telegram ignored by all configured meters!\n");
+                    bool handled = false;
+
+                    for (auto f : telegram_listeners_) {
+                        Telegram copy = t;
+                        if (f) f(&copy);
+                        if (copy.handled) handled = true;
+                    }
+                    if (isVerboseEnabled() && !handled)
+                    {
+                        verbose("(im871a) telegram ignored by all configured meters!\n");
+                    }
                 }
             }
             break;
@@ -585,7 +620,6 @@ bool detectIM871A(string device, SerialCommunicationManager *manager)
     // Wait for 100ms so that the USB stick have time to prepare a response.
     usleep(1000*100);
     serial->receive(&data);
-
     serial->close();
 
     string sent = bin2hex(msg);
@@ -593,9 +627,9 @@ bool detectIM871A(string device, SerialCommunicationManager *manager)
 
     size_t frame_length;
     int endpoint, msgid, payload_len, payload_offset;
-    FrameStatus status = WMBusIM871A::checkFrame(data,
-                                                 &frame_length, &endpoint, &msgid,
-                                                 &payload_len, &payload_offset);
+    FrameStatus status = WMBusIM871A::checkIM871AFrame(data,
+                                                       &frame_length, &endpoint, &msgid,
+                                                       &payload_len, &payload_offset);
     if (status != FullFrame ||
         endpoint != 1 ||
         msgid != 2)

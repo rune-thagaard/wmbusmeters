@@ -346,9 +346,22 @@ void MeterMultical21::processContent(Telegram *t)
                 hex2bin("02FF2004134413A1015B8101E7FF0F", &format_bytes);
                 debug("(%s) using hard coded format for hash 61eb\n", meter_name.c_str());
             }
+            else if (format_signature == 0xd2f7)
+            {
+                hex2bin("02FF2004134413615B5167", &format_bytes);
+                debug("(%s) using hard coded format for hash d2f7\n", meter_name.c_str());
+            }
+            else if (format_signature == 0xdd34)
+            {
+                hex2bin("02FF2004134413", &format_bytes);
+                debug("(%s) using hard coded format for hash dd34\n", meter_name.c_str());
+            }
             else
             {
-                verbose("(%s) ignoring telegram since format signature hash 0x%02x is yet unknown.\n",
+                verbose("(%s) ignoring compressed telegram since format signature hash 0x%02x is yet unknown.\n"
+                        "     this is not a problem, since you only need wait for at most 8 telegrams\n"
+                        "     (8*16 seconds) until an full length telegram arrives and then we know\n"
+                        "     the format giving this hash and start decoding the telegrams properly.\n",
                         meter_name.c_str(),  format_signature);
                 return;
             }
@@ -378,30 +391,30 @@ void MeterMultical21::processContent(Telegram *t)
     extractDVuint16(&values, "02FF20", &offset, &info_codes_);
     t->addMoreExplanation(offset, " info codes (%s)", statusHumanReadable().c_str());
 
-    if(findKey(ValueInformation::Volume, 0, &key, &values)) {
+    if(findKey(MeasurementType::Instantaneous, ValueInformation::Volume, 0, &key, &values)) {
         extractDVdouble(&values, key, &offset, &total_water_consumption_m3_);
         has_total_water_consumption_ = true;
         t->addMoreExplanation(offset, " total consumption (%f m3)", total_water_consumption_m3_);
     }
 
-    if(findKey(ValueInformation::Volume, 1, &key, &values)) {
+    if(findKey(MeasurementType::Unknown, ValueInformation::Volume, 1, &key, &values)) {
         extractDVdouble(&values, key, &offset, &target_water_consumption_m3_);
         has_target_water_consumption_ = true;
         t->addMoreExplanation(offset, " target consumption (%f m3)", target_water_consumption_m3_);
     }
 
-    if(findKey(ValueInformation::VolumeFlow, ANY_STORAGENR, &key, &values)) {
+    if(findKey(MeasurementType::Unknown, ValueInformation::VolumeFlow, ANY_STORAGENR, &key, &values)) {
         extractDVdouble(&values, key, &offset, &max_flow_m3h_);
         has_max_flow_ = true;
         t->addMoreExplanation(offset, " max flow (%f m3/h)", max_flow_m3h_);
     }
 
-    if(findKey(ValueInformation::FlowTemperature, ANY_STORAGENR, &key, &values)) {
+    if(findKey(MeasurementType::Unknown, ValueInformation::FlowTemperature, ANY_STORAGENR, &key, &values)) {
         has_flow_temperature_ = extractDVdouble(&values, key, &offset, &flow_temperature_c_);
         t->addMoreExplanation(offset, " flow temperature (%f °C)", flow_temperature_c_);
     }
 
-    if(findKey(ValueInformation::ExternalTemperature, ANY_STORAGENR, &key, &values)) {
+    if(findKey(MeasurementType::Unknown, ValueInformation::ExternalTemperature, ANY_STORAGENR, &key, &values)) {
         has_external_temperature_ = extractDVdouble(&values, key, &offset, &external_temperature_c_);
         t->addMoreExplanation(offset, " external temperature (%f °C)", external_temperature_c_);
     }

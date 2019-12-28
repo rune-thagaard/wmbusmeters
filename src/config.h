@@ -36,7 +36,13 @@ enum class MeterFileNaming
     Name, Id, NameId
 };
 
-struct Configuration {
+enum class MeterFileTimestamp
+{
+    Never, Day, Hour, Minute, Micros
+};
+
+struct Configuration
+{
     bool daemon {};
     std::string pid_file;
     bool useconfig {};
@@ -53,6 +59,7 @@ struct Configuration {
     std::string meterfiles_dir;
     MeterFileType meterfiles_action {};
     MeterFileNaming meterfiles_naming {};
+    MeterFileTimestamp meterfiles_timestamp {}; // Default is never.
     bool use_logfile {};
     std::string logfile;
     bool json {};
@@ -62,6 +69,7 @@ struct Configuration {
     bool list_shell_envs {};
     bool oneshot {};
     int  exitafter {}; // Seconds to exit.
+    int  reopenafter {}; // Re-open the serial device repeatedly. Silly dongle.
     string device; // auto, /dev/ttyUSB0, simulation.txt, rtlwmbus
     string device_extra; // The frequency or the command line that will start rtlwmbus
     string telegram_reader;
@@ -70,7 +78,8 @@ struct Configuration {
     bool link_mode_configured {};
     bool no_init {};
     std::vector<Unit> conversions;
-    vector<MeterInfo> meters;
+    std::vector<MeterInfo> meters;
+    std::vector<std::string> jsons; // Additional jsons to always add.
 
     ~Configuration() = default;
 };

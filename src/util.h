@@ -24,10 +24,13 @@
 #include<functional>
 #include<vector>
 
+enum class MeterType;
+
 void onExit(std::function<void()> cb);
 void restoreSignalHandlers();
 bool gotHupped();
 void wakeMeUpOnSigChld(pthread_t t);
+bool signalsInstalled();
 
 typedef unsigned char uchar;
 
@@ -75,14 +78,16 @@ bool isValidMatchExpressions(std::string ids, bool non_compliant);
 bool doesIdMatchExpression(std::string id, std::string match);
 bool doesIdMatchExpressions(std::string& id, std::vector<std::string>& ids);
 
-bool isValidKey(std::string& key);
+bool isValidKey(std::string& key, MeterType mt);
 bool isFrequency(std::string& fq);
+bool isNumber(std::string& fq);
 
 std::vector<std::string> splitMatchExpressions(std::string& mes);
 
 void incrementIV(uchar *iv, size_t len);
 
 bool checkCharacterDeviceExists(const char *tty, bool fail_if_not);
+bool checkFileExists(const char *file);
 bool checkIfSimulationFile(const char *file);
 bool checkIfDirExists(const char *dir);
 bool listFiles(std::string dir, std::vector<std::string> *files);
@@ -117,5 +122,15 @@ enum class AccessCheck { NotThere, NotSameGroup, OK };
 AccessCheck checkIfExistsAndSameGroup(std::string device);
 // Count the number of 1:s in the binary number v.
 int countSetBits(int v);
+
+bool startsWith(std::string &s, const char *prefix);
+
+// Given alfa=beta it returns "alfa":"beta"
+std::string makeQuotedJson(std::string &s);
+
+std::string currentDay();
+std::string currentHour();
+std::string currentMinute();
+std::string currentMicros();
 
 #endif

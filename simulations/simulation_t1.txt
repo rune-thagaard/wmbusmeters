@@ -30,6 +30,10 @@ telegram=|4E4401062020202105077A13004085|2F2F0F6D4C389300020043840210|351F040075
 telegram=|4E4401062020202205077A4B004085|2F2F0FE566B99390000087C0B24B732679FF75350010FCFB00004155594265086A0043B4017301DFF600006AE70000BFD5000051BC0000A0F56C2602FFFF1B1B|
 {"media":"water","meter":"apator162","name":"MyTapWaterb","id":"22202020","total_m3":64.508,"timestamp":"1111-11-11T11:11:11Z"}
 
+# Test at-wmbus-16-2 T1 telegram with offset 11
+telegram=|4E4401062020202305077A9D004085|2F2F0F81902C9300000010B82F010041555942BD2882004319027301BC2601005C180100CB0A0100DFF60000A0F56C2602FFFFFFFFFFFFFFFFFFFFFFFFFF5B7C|
+{"media":"water","meter":"apator162","name":"MyTapWaterc","id":"23202020","total_m3":77.752,"timestamp":"1111-11-11T11:11:11Z"}
+
 # Test amiplus/apator electricity meter
 
 telegram=|4E4401061010101002027A00004005|2F2F0E035040691500000B2B300300066D00790C7423400C78371204860BABC8FC100000000E833C8074000000000BAB3C0000000AFDC9FC0136022F2F2F2F2F|
@@ -48,3 +52,25 @@ telegram=|374468506549235827C3A2|129F25383300A8622600008200800A2AF86211517555287
 
 telegram=|7644C52501880188550872|01880188C5255508010000002F2F0B6E332211426E110182016E1102C2016E110382026E1104C2026E110582036E1106C2036E110782046E1108C2046E110982056E1110C2056E111182066E1112C2066E111382076E1114C2076E111582086E1116C2086E111702FD172100|
 {"media":"heat cost allocation","meter":"eurisii","name":"HeatMeter","id":"88018801","current_consumption_hca":112233,"set_date":"","consumption_at_set_date_hca":273,"consumption_at_set_date_1_hca":273,"consumption_at_set_date_2_hca":529,"consumption_at_set_date_3_hca":785,"consumption_at_set_date_4_hca":1041,"consumption_at_set_date_5_hca":1297,"consumption_at_set_date_6_hca":1553,"consumption_at_set_date_7_hca":1809,"consumption_at_set_date_8_hca":2065,"consumption_at_set_date_9_hca":2321,"consumption_at_set_date_10_hca":4113,"consumption_at_set_date_11_hca":4369,"consumption_at_set_date_12_hca":4625,"consumption_at_set_date_13_hca":4881,"consumption_at_set_date_14_hca":5137,"consumption_at_set_date_15_hca":5393,"consumption_at_set_date_16_hca":5649,"consumption_at_set_date_17_hca":5905,"error_flags":"MEASUREMENT RESET","timestamp":"1111-11-11T11:11:11Z"}
+
+# Test Lansen Temperature Hygrometer telegram
+
+telegram=|2e44333003020100071b7a634820252f2f0265840842658308820165950802fb1aae0142fb1aae018201fb1aa9012f|
+{"media":"room sensor","meter":"lansenth","name":"Tempoo","id":"00010203","current_temperature_c":21.8,"current_relative_humidity_rh":43,"average_temperature_1h_c":21.79,"average_relative_humidity_1h_rh":43,"average_temperature_24h_c":21.97,"average_relative_humidity_24h_rh":42.5,"timestamp":"1111-11-11T11:11:11Z"}
+
+# Test BMEters RFM-AMB Temperature Hygrometer telegram
+
+telegram=|5744b40988227711101b7ab20800000265a00842658f088201659f08226589081265a0086265510852652b0902fb1aba0142fb1ab0018201fb1abd0122fb1aa90112fb1aba0162fb1aa60152fb1af501066d3b3bb36b2a00|
+{"media":"room sensor","meter":"rfmamb","name":"Rummet","id":"11772288","current_temperature_c":22.08,"average_temperature_1h_c":21.91,"average_temperature_24h_c":22.07,"maximum_temperature_1h_c":22.08,"minimum_temperature_1h_c":21.85,"maximum_temperature_24h_c":23.47,"minimum_temperature_24h_c":21.29,"current_relative_humidity_rh":44.2,"average_relative_humidity_1h_rh":43.2,"average_relative_humidity_24h_rh":44.5,"minimum_relative_humidity_1h_rh":42.2,"maximum_relative_humidity_1h_rh":50.1,"maximum_relative_humidity_24h_rh":0,"minimum_relative_humidity_24h_rh":0,"device_date_time":"2019-10-11 19:59","timestamp":"1111-11-11T11:11:11Z"}
+
+# Test IZAR RC 868 I R4 PL water meter telegram
+telegram=|1944304C72242421D401A2|013D4013DD8B46A4999C1293E582CC|
+{"media":"water","meter":"izar","name":"IzarWater","id":"21242472","total_m3":3.488,"last_month_total_m3":3.486,"timestamp":"1111-11-11T11:11:11Z"}
+
+# Test Hydrus water meter telegram
+telegram=|4E44A5116464646470077AED004005|2F2F01FD08300C13741100007C1300000000FC101300000000FC201300000000726C00000B3B00000002FD748713025A6800C4016D3B177F2ACC011300020000|
+{"media":"water","meter":"hydrus","name":"HydrusWater","id":"64646464","total_m3":1.174,"max_flow_m3h":0,"flow_temperature_c":10.4,"total_at_date_m3":0.2,"at_date":"2019-10-31 23:59","timestamp":"1111-11-11T11:11:11Z"}
+
+# Test BMeters HydroDigit water telegram
+telegram=|4E44B4098686868613077AF0004005|2F2F0C1366380000046D27287E2A0F150E00000000C10000D10000E60000FD00000C01002F0100410100540100680100890000A00000B30000002F2F2F2F2F2F|
+{"media":"water","meter":"hydrodigit","name":"HydrodigitWater","id":"86868686","total_m3":3.866,"meter_datetime":"2019-10-30 08:39","timestamp":"1111-11-11T11:11:11Z"}
