@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@
 using namespace std;
 
 struct MeterHydrodigit : public virtual WaterMeter, public virtual MeterCommonImplementation {
-    MeterHydrodigit(WMBus *bus, MeterInfo &mi);
+    MeterHydrodigit(MeterInfo &mi);
 
     // Total water counted through the meter
     double totalWaterConsumption(Unit u);
@@ -38,17 +38,15 @@ private:
     string meter_datetime_;
 };
 
-unique_ptr<WaterMeter> createHydrodigit(WMBus *bus, MeterInfo &mi)
+shared_ptr<WaterMeter> createHydrodigit(MeterInfo &mi)
 {
-    return unique_ptr<WaterMeter>(new MeterHydrodigit(bus, mi));
+    return shared_ptr<WaterMeter>(new MeterHydrodigit(mi));
 }
 
-MeterHydrodigit::MeterHydrodigit(WMBus *bus, MeterInfo &mi) :
-    MeterCommonImplementation(bus, mi, MeterType::HYDRODIGIT, MANUFACTURER_BMT)
+MeterHydrodigit::MeterHydrodigit(MeterInfo &mi) :
+    MeterCommonImplementation(mi, MeterType::HYDRODIGIT)
 {
-    setEncryptionMode(EncryptionMode::AES_CBC);
-
-    addMedia(0x07);
+    setExpectedTPLSecurityMode(TPLSecurityMode::AES_CBC_IV);
 
     addLinkMode(LinkMode::T1);
 
@@ -59,31 +57,29 @@ MeterHydrodigit::MeterHydrodigit(WMBus *bus, MeterInfo &mi) :
 
     addPrint("meter_datetime", Quantity::Text,
              [&](){ return meter_datetime_; },
-             "A date.....",
+             "Meter timestamp for measurement.",
              true, true);
-
-    MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
 }
 
 void MeterHydrodigit::processContent(Telegram *t)
 {
-    map<string,pair<int,DVEntry>> values;
-    parseDV(t, t->content, t->content.begin(), t->content.size(), &values);
-
     int offset;
     string key;
 
-    if(findKey(MeasurementType::Unknown, ValueInformation::Volume, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &total_water_consumption_m3_);
+    if(findKey(MeasurementType::Unknown, ValueInformation::Volume, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &total_water_consumption_m3_);
         t->addMoreExplanation(offset, " total consumption (%f m3)", total_water_consumption_m3_);
     }
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::DateTime, 0, &key, &values)) {
+    if (findKey(MeasurementType::Unknown, ValueInformation::DateTime, 0, 0, &key, &t->values)) {
         struct tm datetime;
-        extractDVdate(&values, key, &offset, &datetime);
+        extractDVdate(&t->values, key, &offset, &datetime);
         meter_datetime_ = strdatetime(&datetime);
         t->addMoreExplanation(offset, " meter_datetime (%s)", meter_datetime_.c_str());
     }
+
+    vector<uchar> data;
+    t->extractMfctData(&data);
 }
 
 double MeterHydrodigit::totalWaterConsumption(Unit u)

@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -16,6 +16,8 @@
 */
 
 #include"wmbus.h"
+#include"wmbus_common_implementation.h"
+#include"wmbus_utils.h"
 #include"serial.h"
 
 #include<assert.h>
@@ -24,21 +26,21 @@
 #include<pthread.h>
 #include<semaphore.h>
 #include<string.h>
-#include<sys/errno.h>
+#include<errno.h>
 #include<sys/stat.h>
 #include<sys/types.h>
 #include<unistd.h>
 
 using namespace std;
 
-enum FrameStatus { PartialFrame, FullFrame, ErrorInFrame, TextAndNotFrame };
-
-struct WMBusRTLWMBUS : public WMBus
+struct WMBusRTLWMBUS : public virtual WMBusCommonImplementation
 {
     bool ping();
-    uint32_t getDeviceId();
+    string getDeviceId();
+    string getDeviceUniqueId();
     LinkModeSet getLinkModes();
-    void setLinkModes(LinkModeSet lms);
+    void deviceReset();
+    void deviceSetLinkModes(LinkModeSet lms);
     LinkModeSet supportedLinkModes() {
         return
             C1_bit |
@@ -47,56 +49,60 @@ struct WMBusRTLWMBUS : public WMBus
     int numConcurrentLinkModes() { return 2; }
     bool canSetLinkModes(LinkModeSet lms)
     {
-        if (!supportedLinkModes().supports(lms)) return false;
+        //if (!supportedLinkModes().supports(lms)) return false;
         // The rtlwmbus listens to both modes always.
         return true;
     }
-    void onTelegram(function<void(Telegram*)> cb);
 
     void processSerialData();
-    SerialDevice *serial() { return NULL; }
     void simulate();
 
-    WMBusRTLWMBUS(unique_ptr<SerialDevice> serial, SerialCommunicationManager *manager);
+    WMBusRTLWMBUS(string serialnr, shared_ptr<SerialDevice> serial, shared_ptr<SerialCommunicationManager> manager);
+    ~WMBusRTLWMBUS() { }
 
 private:
-    unique_ptr<SerialDevice> serial_;
+
+    string serialnr_;
     vector<uchar> read_buffer_;
     vector<uchar> received_payload_;
-    vector<function<void(Telegram*)>> telegram_listeners_;
+    bool warning_dll_len_printed_ {};
+
+    LinkModeSet device_link_modes_;
 
     FrameStatus checkRTLWMBUSFrame(vector<uchar> &data,
                                    size_t *hex_frame_length,
                                    int *hex_payload_len_out,
-                                   int *hex_payload_offset);
+                                   int *hex_payload_offset,
+                                   double *rssi);
     void handleMessage(vector<uchar> &frame);
 
     string setup_;
-    SerialCommunicationManager *manager_ {};
 };
 
-unique_ptr<WMBus> openRTLWMBUS(string command, SerialCommunicationManager *manager,
-                               function<void()> on_exit, unique_ptr<SerialDevice> serial_override)
+shared_ptr<WMBus> openRTLWMBUS(string serialnr, string command, shared_ptr<SerialCommunicationManager> manager,
+                               function<void()> on_exit, shared_ptr<SerialDevice> serial_override)
 {
+    debug("(rtlwmbus) opening %s\n", serialnr.c_str());
+
     vector<string> args;
     vector<string> envs;
     args.push_back("-c");
     args.push_back(command);
     if (serial_override)
     {
-        WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(std::move(serial_override), manager);
-        return unique_ptr<WMBus>(imp);
+        WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(serialnr, serial_override, manager);
+        imp->markSerialAsOverriden();
+        return shared_ptr<WMBus>(imp);
     }
-    auto serial = manager->createSerialDeviceCommand("/bin/sh", args, envs, on_exit);
-    WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(std::move(serial), manager);
-    return unique_ptr<WMBus>(imp);
+    auto serial = manager->createSerialDeviceCommand(serialnr, "/bin/sh", args, envs, on_exit, "rtlwmbus");
+    WMBusRTLWMBUS *imp = new WMBusRTLWMBUS(serialnr, serial, manager);
+    return shared_ptr<WMBus>(imp);
 }
 
-WMBusRTLWMBUS::WMBusRTLWMBUS(unique_ptr<SerialDevice> serial, SerialCommunicationManager *manager) :
-    serial_(std::move(serial)), manager_(manager)
+WMBusRTLWMBUS::WMBusRTLWMBUS(string serialnr, shared_ptr<SerialDevice> serial, shared_ptr<SerialCommunicationManager> manager) :
+    WMBusCommonImplementation(DEVICE_RTLWMBUS, manager, serial, false), serialnr_(serialnr)
 {
-    manager_->listenTo(serial_.get(),call(this,processSerialData));
-    serial_->open(true);
+    reset();
 }
 
 bool WMBusRTLWMBUS::ping()
@@ -104,23 +110,31 @@ bool WMBusRTLWMBUS::ping()
     return true;
 }
 
-uint32_t WMBusRTLWMBUS::getDeviceId()
+string WMBusRTLWMBUS::getDeviceId()
 {
-    return 0x11111111;
+    return serialnr_;
+}
+
+string WMBusRTLWMBUS::getDeviceUniqueId()
+{
+    return "?";
 }
 
 LinkModeSet WMBusRTLWMBUS::getLinkModes()
 {
-
-    return Any_bit;
+    return device_link_modes_;
 }
 
-void WMBusRTLWMBUS::setLinkModes(LinkModeSet lm)
+void WMBusRTLWMBUS::deviceReset()
 {
 }
 
-void WMBusRTLWMBUS::onTelegram(function<void(Telegram*)> cb) {
-    telegram_listeners_.push_back(cb);
+void WMBusRTLWMBUS::deviceSetLinkModes(LinkModeSet lm)
+{
+    LinkModeSet lms;
+    lms.addLinkMode(LinkMode::C1);
+    lms.addLinkMode(LinkMode::T1);
+    device_link_modes_ = lms;
 }
 
 void WMBusRTLWMBUS::simulate()
@@ -132,7 +146,7 @@ void WMBusRTLWMBUS::processSerialData()
     vector<uchar> data;
 
     // Receive and accumulated serial data until a full frame has been received.
-    serial_->receive(&data);
+    serial()->receive(&data);
     read_buffer_.insert(read_buffer_.end(), data.begin(), data.end());
 
     size_t frame_length;
@@ -140,7 +154,8 @@ void WMBusRTLWMBUS::processSerialData()
 
     for (;;)
     {
-        FrameStatus status = checkRTLWMBUSFrame(read_buffer_, &frame_length, &hex_payload_len, &hex_payload_offset);
+        double rssi = 0;
+        FrameStatus status = checkRTLWMBUSFrame(read_buffer_, &frame_length, &hex_payload_len, &hex_payload_offset, &rssi);
 
         if (status == PartialFrame)
         {
@@ -155,7 +170,6 @@ void WMBusRTLWMBUS::processSerialData()
         if (status == ErrorInFrame)
         {
             debug("(rtlwmbus) error in received message.\n");
-            string msg = bin2hex(read_buffer_);
             read_buffer_.clear();
             break;
         }
@@ -184,28 +198,22 @@ void WMBusRTLWMBUS::processSerialData()
             }
 
             read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
-            handleMessage(payload);
-        }
-    }
-}
+            if (payload.size() > 0)
+            {
+                if (payload[0] != payload.size()-1)
+                {
+                    if (!warning_dll_len_printed_)
+                    {
+                        warning("(rtlwmbus) dll_len adjusted to %d from %d. Upgrade rtl_wmbus? This warning will not be printed again.\n", payload.size()-1, payload[0]);
+                        warning_dll_len_printed_ = true;
+                    }
+                    payload[0] = payload.size()-1;
+                }
+            }
 
-void WMBusRTLWMBUS::handleMessage(vector<uchar> &frame)
-{
-    Telegram t;
-    bool ok = t.parse(frame);
-
-    if (ok)
-    {
-        bool handled = false;
-        for (auto f : telegram_listeners_)
-        {
-            Telegram copy = t;
-            if (f) f(&copy);
-            if (copy.handled) handled = true;
-        }
-        if (isVerboseEnabled() && !handled)
-        {
-            verbose("(rtlwmbus) telegram ignored by all configured meters!\n");
+            string id = string("rtlwmbus[")+getDeviceId()+"]";
+            AboutTelegram about(id, rssi);
+            handleTelegram(about, payload);
         }
     }
 }
@@ -213,31 +221,55 @@ void WMBusRTLWMBUS::handleMessage(vector<uchar> &frame)
 FrameStatus WMBusRTLWMBUS::checkRTLWMBUSFrame(vector<uchar> &data,
                                               size_t *hex_frame_length,
                                               int *hex_payload_len_out,
-                                              int *hex_payload_offset)
+                                              int *hex_payload_offset,
+                                              double *rssi)
 {
     // C1;1;1;2019-02-09 07:14:18.000;117;102;94740459;0x49449344590474943508780dff5f3500827f0000f10007b06effff530100005f2c620100007f2118010000008000800080008000000000000000000e003f005500d4ff2f046d10086922
     // There might be a second telegram on the same line ;0x4944.......
     if (data.size() == 0) return PartialFrame;
+
+    if (isDebugEnabled())
+    {
+        string msg = safeString(data);
+        debug("(rtlwmbus) checkRTLWMBusFrame \"%s\"\n", msg.c_str());
+    }
+
     int payload_len = 0;
     size_t eolp = 0;
     // Look for end of line
     for (; eolp < data.size(); ++eolp) {
         if (data[eolp] == '\n') break;
     }
-    if (eolp >= data.size()) return PartialFrame;
+    if (eolp >= data.size())
+    {
+        debug("(rtlwmbus) no eol found, partial frame\n");
+        return PartialFrame;
+    }
 
     // We got a full line, but if it is too short, then
     // there is something wrong. Discard the data.
-    if (data.size() < 10) return ErrorInFrame;
+    if (data.size() < 10)
+    {
 
-    if (data[0] != '0' || data[1] != 'x') {
+        debug("(rtlwmbus) too short line\n");
+        return ErrorInFrame;
+    }
+
+    if (data[0] != '0' || data[1] != 'x')
+    {
         // Discard lines that do not begin with T1 or C1, these lines are probably
         // stderr output from rtl_sdr/rtl_wmbus.
         if (!(data[0] == 'T' && data[1] == '1') &&
-            !(data[0] == 'C' && data[1] == '1')) return TextAndNotFrame;
+            !(data[0] == 'C' && data[1] == '1'))
+        {
+
+            debug("(rtlwmbus) only text\n");
+            return TextAndNotFrame;
+        }
 
         // And the checksums should match.
-        if (strncmp((const char*)&data[1], "1;1", 3)) {
+        if (strncmp((const char*)&data[1], "1;1", 3))
+        {
             // Packages that begin with C1;1 or with T1;1 are good. The full format is:
             // MODE;CRC_OK;3OUTOF6OK;TIMESTAMP;PACKET_RSSI;CURRENT_RSSI;LINK_LAYER_IDENT_NO;DATAGRAM_WITHOUT_CRC_BYTES.
             // 3OUTOF6OK makes sense only with mode T1 and no sense with mode C1 (always set to 1).
@@ -247,12 +279,34 @@ FrameStatus WMBusRTLWMBUS::checkRTLWMBUSFrame(vector<uchar> &data,
             return ErrorInFrame;
         }
     }
-    // Look for start of telegram 0x
     size_t i = 0;
+    int count = 0;
+    // Look for packet rssi
+    for (; i+1 < data.size(); ++i) {
+        if (data[i] == ';') count++;
+        if (count == 4) break;
+    }
+    if (count == 4)
+    {
+        size_t from = i+1;
+        for (i++; i<data.size(); ++i) {
+            if (data[i] == ';') break;
+        }
+        if ((i-from)<5)
+        {
+            string rssis = string(data.begin()+from,data.begin()+i);
+            *rssi = atof(rssis.c_str());
+        }
+    }
+
+    // Look for start of telegram 0x
     for (; i+1 < data.size(); ++i) {
         if (data[i] == '0' && data[i+1] == 'x') break;
     }
-    if (i+1 >= data.size()) return ErrorInFrame; // No 0x found, then discard the frame.
+    if (i+1 >= data.size())
+    {
+        return ErrorInFrame; // No 0x found, then discard the frame.
+    }
     i+=2; // Skip 0x
 
     // Look for end of line or semicolon.
@@ -260,20 +314,23 @@ FrameStatus WMBusRTLWMBUS::checkRTLWMBUSFrame(vector<uchar> &data,
         if (data[eolp] == '\n') break;
         if (data[eolp] == ';' && data[eolp+1] == '0' && data[eolp+2] == 'x') break;
     }
-    if (eolp >= data.size()) return PartialFrame;
+    if (eolp >= data.size())
+    {
+        debug("(rtlwmbus) no eol or semicolon, partial frame\n");
+        return PartialFrame;
+    }
 
     payload_len = eolp-i;
     *hex_payload_len_out = payload_len;
     *hex_payload_offset = i;
     *hex_frame_length = eolp+1;
 
-    debug("(rtlwmbus) got full frame\n");
+    debug("(rtlwmbus) received full frame\n");
     return FullFrame;
 }
 
-bool detectRTLSDR(string device, SerialCommunicationManager *manager)
+AccessCheck detectRTLWMBUS(Detected *detected, shared_ptr<SerialCommunicationManager> handler)
 {
-    // No more advanced test than that the /dev/rtlsdr link exists.
-    AccessCheck ac = checkIfExistsAndSameGroup(device);
-    return ac == AccessCheck::OK;
+    assert(0);
+    return AccessCheck::NotThere;
 }

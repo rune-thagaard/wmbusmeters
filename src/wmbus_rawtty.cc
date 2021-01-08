@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -16,72 +16,62 @@
 */
 
 #include"wmbus.h"
+#include"wmbus_common_implementation.h"
+#include"wmbus_utils.h"
 #include"serial.h"
 
 #include<assert.h>
 #include<pthread.h>
 #include<semaphore.h>
-#include<sys/errno.h>
+#include<errno.h>
 #include<unistd.h>
 
 using namespace std;
 
-enum FrameStatus { PartialFrame, FullFrame, ErrorInFrame };
-
-struct WMBusRawTTY : public WMBus
+struct WMBusRawTTY : public virtual WMBusCommonImplementation
 {
     bool ping();
-    uint32_t getDeviceId();
+    string getDeviceId();
+    string getDeviceUniqueId();
     LinkModeSet getLinkModes();
-    void setLinkModes(LinkModeSet lms);
+    void deviceReset();
+    void deviceSetLinkModes(LinkModeSet lms);
     LinkModeSet supportedLinkModes() { return Any_bit; }
     int numConcurrentLinkModes() { return 0; }
     bool canSetLinkModes(LinkModeSet desired_modes) { return true; }
-    void onTelegram(function<void(Telegram*)> cb);
 
     void processSerialData();
-    void getConfiguration();
-    SerialDevice *serial() { return serial_.get(); }
     void simulate() { }
 
-    WMBusRawTTY(unique_ptr<SerialDevice> serial, SerialCommunicationManager *manager);
+    WMBusRawTTY(shared_ptr<SerialDevice> serial, shared_ptr<SerialCommunicationManager> manager);
     ~WMBusRawTTY() { }
 
 private:
-    unique_ptr<SerialDevice> serial_;
-    SerialCommunicationManager *manager_;
+
     vector<uchar> read_buffer_;
-    sem_t command_wait_;
     LinkModeSet link_modes_;
     vector<uchar> received_payload_;
-    vector<function<void(Telegram*)>> telegram_listeners_;
-
-    void waitForResponse();
-    FrameStatus checkRawTTYFrame(vector<uchar> &data,
-                                 size_t *frame_length,
-                                 int *payload_len_out,
-                                 int *payload_offset);
-    void handleMessage(vector<uchar> &frame);
 };
 
-unique_ptr<WMBus> openRawTTY(string device, int baudrate, SerialCommunicationManager *manager, unique_ptr<SerialDevice> serial_override)
+shared_ptr<WMBus> openRawTTY(string device, int baudrate, shared_ptr<SerialCommunicationManager> manager, shared_ptr<SerialDevice> serial_override)
 {
+    assert(device != "");
+
     if (serial_override)
     {
-        WMBusRawTTY *imp = new WMBusRawTTY(std::move(serial_override), manager);
-        return unique_ptr<WMBus>(imp);
+        WMBusRawTTY *imp = new WMBusRawTTY(serial_override, manager);
+        imp->markAsNoLongerSerial();
+        return shared_ptr<WMBus>(imp);
     }
-    auto serial = manager->createSerialDeviceTTY(device.c_str(), baudrate);
-    WMBusRawTTY *imp = new WMBusRawTTY(std::move(serial), manager);
-    return unique_ptr<WMBus>(imp);
+    auto serial = manager->createSerialDeviceTTY(device.c_str(), baudrate, "rawtty");
+    WMBusRawTTY *imp = new WMBusRawTTY(serial, manager);
+    return shared_ptr<WMBus>(imp);
 }
 
-WMBusRawTTY::WMBusRawTTY(unique_ptr<SerialDevice> serial, SerialCommunicationManager *manager) :
-    serial_(std::move(serial)), manager_(manager)
+WMBusRawTTY::WMBusRawTTY(shared_ptr<SerialDevice> serial, shared_ptr<SerialCommunicationManager> manager) :
+    WMBusCommonImplementation(DEVICE_RAWTTY, manager, serial, true)
 {
-    sem_init(&command_wait_, 0, 0);
-    manager_->listenTo(serial_.get(),call(this,processSerialData));
-    serial_->open(true);
+    reset();
 }
 
 bool WMBusRawTTY::ping()
@@ -89,102 +79,34 @@ bool WMBusRawTTY::ping()
     return true;
 }
 
-uint32_t WMBusRawTTY::getDeviceId()
+string WMBusRawTTY::getDeviceId()
 {
-    return 0;
+    return "?";
+}
+
+string WMBusRawTTY::getDeviceUniqueId()
+{
+    return "?";
 }
 
 LinkModeSet WMBusRawTTY::getLinkModes() {
     return link_modes_;
 }
 
-void WMBusRawTTY::getConfiguration()
+void WMBusRawTTY::deviceReset()
 {
 }
 
-void WMBusRawTTY::setLinkModes(LinkModeSet lms)
+void WMBusRawTTY::deviceSetLinkModes(LinkModeSet lms)
 {
-    link_modes_ = lms;
-}
-
-void WMBusRawTTY::onTelegram(function<void(Telegram*)> cb) {
-    telegram_listeners_.push_back(cb);
-}
-
-void WMBusRawTTY::waitForResponse() {
-    while (manager_->isRunning()) {
-        int rc = sem_wait(&command_wait_);
-        if (rc==0) break;
-        if (rc==-1) {
-            if (errno==EINTR) continue;
-            break;
-        }
-    }
-}
-
-FrameStatus WMBusRawTTY::checkRawTTYFrame(vector<uchar> &data,
-                                          size_t *frame_length,
-                                          int *payload_len_out,
-                                          int *payload_offset)
-{
-    // Nice clean: 2A442D2C998734761B168D2021D0871921|58387802FF2071000413F81800004413F8180000615B
-    // Ugly: 00615B2A442D2C998734761B168D2021D0871921|58387802FF2071000413F81800004413F8180000615B
-    // Here the frame is prefixed with some random data.
-
-    if (data.size() < 11) {
-        return PartialFrame;
-    }
-    int payload_len = data[0];
-    int type = data[1];
-    int offset = 1;
-
-    if (type != 0x44)
-    {
-        // Ouch, we are out of sync with the wmbus frames that we expect!
-        // Since we currently do not handle any other type of frame, we can
-        // look for the byte 0x44 in the buffer. If we find a 0x44 byte and
-        // the length byte before it maps to the end of the buffer,
-        // then we have found a valid telegram.
-        bool found = false;
-        for (size_t i = 0; i < data.size()-2; ++i)
-        {
-            if (data[i+1] == 0x44)
-            {
-                payload_len = data[i];
-                size_t remaining = data.size()-i;
-                if (data[i]+1 == (uchar)remaining && data[i+1] == 0x44)
-                {
-                    found = true;
-                    offset = i+1;
-                    verbose("(wmbus_rawtty) out of sync, skipping %d bytes.\n", (int)i);
-                    break;
-                }
-            }
-        }
-        if (!found)
-        {
-            // No sensible telegram in the buffer. Flush it!
-            verbose("(wmbus_rawtty) no sensible telegram found, clearing buffer.\n");
-            data.clear();
-            return ErrorInFrame;
-        }
-    }
-    *payload_len_out = payload_len;
-    *payload_offset = offset;
-    *frame_length = payload_len+offset;
-    if (data.size() < *frame_length) {
-        return PartialFrame;
-    }
-    return FullFrame;
 }
 
 void WMBusRawTTY::processSerialData()
 {
-
     vector<uchar> data;
 
     // Receive and accumulated serial data until a full frame has been received.
-    serial_->receive(&data);
+    serial()->receive(&data);
 
     read_buffer_.insert(read_buffer_.end(), data.begin(), data.end());
 
@@ -193,7 +115,7 @@ void WMBusRawTTY::processSerialData()
 
     for (;;)
     {
-        FrameStatus status = checkRawTTYFrame(read_buffer_, &frame_length, &payload_len, &payload_offset);
+        FrameStatus status = checkWMBusFrame(read_buffer_, &frame_length, &payload_len, &payload_offset);
 
         if (status == PartialFrame)
         {
@@ -218,41 +140,27 @@ void WMBusRawTTY::processSerialData()
                 payload.insert(payload.end(), read_buffer_.begin()+payload_offset, read_buffer_.begin()+payload_offset+payload_len);
             }
             read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin()+frame_length);
-            handleMessage(payload);
+            AboutTelegram about("", 0);
+            handleTelegram(about, payload);
         }
     }
 }
 
-void WMBusRawTTY::handleMessage(vector<uchar> &frame)
+AccessCheck detectRAWTTY(Detected *detected, shared_ptr<SerialCommunicationManager> manager)
 {
-    Telegram t;
-    bool ok = t.parse(frame);
-    if (ok)
-    {
-        bool handled = false;
-        for (auto f : telegram_listeners_)
-        {
-            Telegram copy = t;
-            if (f) {
-                f(&copy);
-            }
-            if (copy.handled) handled = true;
-        }
-        if (isVerboseEnabled() && !handled)
-        {
-            verbose("(rawtty) telegram ignored by all configured meters!\n");
-        }
-    }
-}
+    string tty = detected->specified_device.file;
+    int bps = atoi(detected->specified_device.bps.c_str());
 
-bool detectRawTTY(string device, int baud, SerialCommunicationManager *manager)
-{
     // Since we do not know how to talk to the other end, it might not
     // even respond. The only thing we can do is to try to open the serial device.
-    auto serial = manager->createSerialDeviceTTY(device.c_str(), baud);
-    bool ok = serial->open(false);
-    if (!ok) return false;
+    auto serial = manager->createSerialDeviceTTY(tty.c_str(), bps, "detect rawtty");
+    AccessCheck rc = serial->open(false);
+    if (rc != AccessCheck::AccessOK) return AccessCheck::NotThere;
 
     serial->close();
-    return true;
+
+    detected->setAsFound("", WMBusDeviceType::DEVICE_RAWTTY, bps, false, false,
+        detected->specified_device.linkmodes);
+
+    return AccessCheck::AccessOK;
 }

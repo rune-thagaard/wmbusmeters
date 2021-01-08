@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -18,8 +18,13 @@
 #ifndef WMBUS_UTILS_H
 #define WMBUS_UTILS_H
 
-void decryptMode1_AES_CTR(Telegram *t, vector<uchar> &aeskey);
-void decryptMode5_AES_CBC(Telegram *t, vector<uchar> &aeskey);
+#include "util.h"
+#include "threads.h"
+#include "wmbus.h"
+
+bool decrypt_ELL_AES_CTR(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey);
+bool decrypt_TPL_AES_CBC_IV(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey);
+bool decrypt_TPL_AES_CBC_NO_IV(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey);
 string frameTypeKamstrupC1(int ft);
 
 #endif

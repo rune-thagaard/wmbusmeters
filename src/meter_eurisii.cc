@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -21,8 +21,8 @@
 #include"wmbus.h"
 #include"wmbus_utils.h"
 
-struct MeterEurisII : public virtual HeatCostMeter, public virtual MeterCommonImplementation {
-    MeterEurisII(WMBus *bus, MeterInfo &mi);
+struct MeterEurisII : public virtual HeatCostAllocationMeter, public virtual MeterCommonImplementation {
+    MeterEurisII(MeterInfo &mi);
 
     double currentConsumption(Unit u);
     string setDate();
@@ -41,16 +41,12 @@ private:
     uint16_t error_flags_;
 };
 
-MeterEurisII::MeterEurisII(WMBus *bus, MeterInfo &mi) :
-    MeterCommonImplementation(bus, mi, MeterType::EURISII, MANUFACTURER_INE)
+MeterEurisII::MeterEurisII(MeterInfo &mi) :
+    MeterCommonImplementation(mi, MeterType::EURISII)
 {
-    setEncryptionMode(EncryptionMode::AES_CBC);
-
-    addMedia(0x08);
+    setExpectedTPLSecurityMode(TPLSecurityMode::AES_CBC_IV);
 
     addLinkMode(LinkMode::T1);
-
-    setExpectedVersion(0x55);
 
     addPrint("current_consumption", Quantity::HCA,
              [&](Unit u){ return currentConsumption(u); },
@@ -82,13 +78,11 @@ MeterEurisII::MeterEurisII(WMBus *bus, MeterInfo &mi) :
              [&](){ return errorFlagsHumanReadable(); },
              "Error flags.",
              true, true);
-
-    MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
 }
 
-unique_ptr<HeatCostMeter> createEurisII(WMBus *bus, MeterInfo &mi)
+shared_ptr<HeatCostAllocationMeter> createEurisII(MeterInfo &mi)
 {
-    return unique_ptr<HeatCostMeter>(new MeterEurisII(bus, mi));
+    return shared_ptr<HeatCostAllocationMeter>(new MeterEurisII(mi));
 }
 
 double MeterEurisII::currentConsumption(Unit u)
@@ -211,39 +205,36 @@ void MeterEurisII::processContent(Telegram *t)
     // (eurisii) 6c: 17 vife (Error flags (binary))
     // (eurisii) 6d: * 0000 error flags (0000)
 
-    map<string,pair<int,DVEntry>> values;
-    parseDV(t, t->content, t->content.begin(), t->content.size(), &values);
-
     int offset;
     string key;
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::HeatCostAllocation, 0, &key, &values))
+    if (findKey(MeasurementType::Unknown, ValueInformation::HeatCostAllocation, 0, 0, &key, &t->values))
     {
-        extractDVdouble(&values, key, &offset, &current_consumption_hca_);
+        extractDVdouble(&t->values, key, &offset, &current_consumption_hca_);
         t->addMoreExplanation(offset, " current consumption (%f hca)", current_consumption_hca_);
     }
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::Date, 1, &key, &values)) {
+    if (findKey(MeasurementType::Unknown, ValueInformation::Date, 1, 0, &key, &t->values)) {
         struct tm date;
-        extractDVdate(&values, key, &offset, &date);
+        extractDVdate(&t->values, key, &offset, &date);
         set_date_ = strdate(&date);
         t->addMoreExplanation(offset, " set date (%s)", set_date_.c_str());
     }
 
     for (int i=1; i<=17; ++i)
     {
-        if (findKey(MeasurementType::Unknown, ValueInformation::HeatCostAllocation, i, &key, &values))
+        if (findKey(MeasurementType::Unknown, ValueInformation::HeatCostAllocation, i, 0, &key, &t->values))
         {
             string info;
             strprintf(info, " consumption at set date %d (%%f hca)", i);
-            extractDVdouble(&values, key, &offset, &consumption_at_set_date_hca_[i-1]);
+            extractDVdouble(&t->values, key, &offset, &consumption_at_set_date_hca_[i-1]);
             t->addMoreExplanation(offset, info.c_str(), consumption_at_set_date_hca_[i-1]);
         }
     }
 
     key = "02FD17";
-    if (hasKey(&values, key)) {
-        extractDVuint16(&values, "02FD17", &offset, &error_flags_);
+    if (hasKey(&t->values, key)) {
+        extractDVuint16(&t->values, "02FD17", &offset, &error_flags_);
         t->addMoreExplanation(offset, " error flags (%04X)", error_flags_);
     }
 }

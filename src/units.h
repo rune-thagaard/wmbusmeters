@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -21,29 +21,40 @@
 #include<string>
 #include<vector>
 
-#define LIST_OF_QUANTITIES \
-    X(Energy,KWH)          \
-    X(Power,KW)            \
-    X(Volume,M3)           \
-    X(Flow,M3H)            \
-    X(Temperature,C)       \
-    X(RelativeHumidity,RH) \
-    X(HCA,HCA)             \
-    X(Text,TXT)            \
-
+#define LIST_OF_QUANTITIES   \
+    X(Energy,KWH)            \
+    X(Reactive_Energy,KVARH) \
+    X(Apparent_Energy,KVAH)  \
+    X(Power,KW)              \
+    X(Volume,M3)             \
+    X(Flow,M3H)              \
+    X(Temperature,C)         \
+    X(RelativeHumidity,RH)   \
+    X(HCA,HCA)               \
+    X(Text,TXT)              \
+    X(Counter,INT)           \
+    X(Time,Hour)             \
 
 #define LIST_OF_UNITS \
-    X(KWH,kwh,kWh,Energy,"kilo Watt hour")  \
-    X(GJ,gj,GJ,Energy,"Giga Joule")         \
-    X(M3,m3,m3,Volume,"cubic meter")        \
-    X(L,l,l,Volume,"litre")                 \
-    X(KW,kw,kW,Power,"kilo Watt")           \
-    X(M3H,m3h,m3/h,Flow,"cubic meters per hour") \
-    X(C,c,°C,Temperature,"celsius")         \
-    X(F,f,°F,Temperature,"fahrenheit")      \
-    X(RH,rh,RH,RelativeHumidity,"relative humidity")      \
-    X(HCA,hca,hca,HCA,"heat cost allocation") \
-    X(TXT,txt,txt,Text,"text")              \
+    X(KWH,kwh,"kWh",Energy,"kilo Watt hour")  \
+    X(MJ,mj,"MJ",Energy,"Mega Joule")         \
+    X(GJ,gj,"GJ",Energy,"Giga Joule")         \
+    X(KVARH,kvarh,"kVARh",Reactive_Energy,"kilo volt amperes reactive hour")  \
+    X(KVAH,kvah,"kVAh",Apparent_Energy,"kilo volt amperes hour")  \
+    X(M3,m3,"m3",Volume,"cubic meter")        \
+    X(L,l,"l",Volume,"litre")                 \
+    X(KW,kw,"kW",Power,"kilo Watt")           \
+    X(M3H,m3h,"m3/h",Flow,"cubic meters per hour") \
+    X(LH,lh,"l/h",Flow,"liters per hour") \
+    X(C,c,"°C",Temperature,"celsius")         \
+    X(F,f,"°F",Temperature,"fahrenheit")      \
+    X(RH,rh,"RH",RelativeHumidity,"relative humidity")      \
+    X(HCA,hca,"hca",HCA,"heat cost allocation") \
+    X(TXT,txt,"txt",Text,"text")              \
+    X(INT,int,"int",Counter,"int")              \
+    X(Second,s,"s",Time,"second")           \
+    X(Hour,h,"h",Time,"hour") \
+    X(Year,y,"y",Time,"year")
 
 enum class Unit
 {

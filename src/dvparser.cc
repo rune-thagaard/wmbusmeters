@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2018-2019 Fredrik Öhrström
+ Copyright (C) 2018-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -29,14 +29,23 @@
 
 using namespace std;
 
-const char *ValueInformationName(ValueInformation v)
+const char *toString(ValueInformation v)
 {
     switch (v) {
+        case ValueInformation::None: return "None";
 #define X(name,from,to) case ValueInformation::name: return #name;
 LIST_OF_VALUETYPES
 #undef X
     }
     assert(0);
+}
+
+ValueInformation toValueInformation(int i)
+{
+#define X(name,from,to) if (from >= i && i <= to) return ValueInformation::name;
+LIST_OF_VALUETYPES
+#undef X
+    return ValueInformation::None;
 }
 
 map<uint16_t,string> hash_to_format_;
@@ -126,12 +135,23 @@ bool parseDV(Telegram *t,
         int datalen = difLenBytes(dif);
         DEBUG_PARSER("(dvparser debug) dif=%02x datalen=%d \"%s\" type=%s\n", dif, datalen, difType(dif).c_str(),
                      measurementTypeName(mt).c_str());
-        if (datalen == -2) {
-            debug("(dvparser) cannot handle dif %02X ignoring rest of telegram.\n\n", dif);
+        if (datalen == -2)
+        {
+            if (dif == 0x0f)
+            {
+                DEBUG_PARSER("(dvparser) reached manufacturer specific data 0f, parsing is done.\n");
+                datalen = std::distance(data,data_end);
+                string value = bin2hex(data+1, data_end, datalen-1);
+                t->mfct_0f_index = 1+std::distance(data_start, data);
+                assert(t->mfct_0f_index >= 0);
+                t->addExplanationAndIncrementPos(data, datalen, "%02X manufacturer specific data %s", dif, value.c_str());
+                break;
+            }
+            debug("(dvparser) cannot handle dif %02X ignoring rest of telegram.\n", dif);
             break;
         }
         if (dif == 0x2f) {
-            t->addExplanation(*format, 1, "%02X skip", dif);
+            t->addExplanationAndIncrementPos(*format, 1, "%02X skip", dif);
             DEBUG_PARSER("\n");
             continue;
         }
@@ -143,7 +163,7 @@ bool parseDV(Telegram *t,
         if (data_has_difvifs) {
             format_bytes.push_back(dif);
             id_bytes.push_back(dif);
-            t->addExplanation(*format, 1, "%02X dif (%s)", dif, difType(dif).c_str());
+            t->addExplanationAndIncrementPos(*format, 1, "%02X dif (%s)", dif, difType(dif).c_str());
         } else {
             id_bytes.push_back(**format);
             (*format)++;
@@ -173,7 +193,7 @@ bool parseDV(Telegram *t,
             if (data_has_difvifs) {
                 format_bytes.push_back(dife);
                 id_bytes.push_back(dife);
-                t->addExplanation(*format, 1, "%02X dife (subunit=%d tariff=%d storagenr=%d)",
+                t->addExplanationAndIncrementPos(*format, 1, "%02X dife (subunit=%d tariff=%d storagenr=%d)",
                                   dife, subunit, tariff, storage_nr);
             } else {
                 id_bytes.push_back(**format);
@@ -191,7 +211,7 @@ bool parseDV(Telegram *t,
         if (data_has_difvifs) {
             format_bytes.push_back(vif);
             id_bytes.push_back(vif);
-            t->addExplanation(*format, 1, "%02X vif (%s)", vif, vifType(vif).c_str());
+            t->addExplanationAndIncrementPos(*format, 1, "%02X vif (%s)", vif, vifType(vif).c_str());
         } else {
             id_bytes.push_back(**format);
             (*format)++;
@@ -205,7 +225,7 @@ bool parseDV(Telegram *t,
             if (data_has_difvifs) {
                 format_bytes.push_back(vife);
                 id_bytes.push_back(vife);
-                t->addExplanation(*format, 1, "%02X vife (%s)", vife, vifeType(dif, vif, vife).c_str());
+                t->addExplanationAndIncrementPos(*format, 1, "%02X vife (%s)", vife, vifeType(dif, vif, vife).c_str());
             } else {
                 id_bytes.push_back(**format);
                 (*format)++;
@@ -247,14 +267,14 @@ bool parseDV(Telegram *t,
 
         // Skip the length byte in the variable length data.
         if (variable_length) {
-            t->addExplanation(data, 1, "%02X varlen=%d", datalen, datalen);
+            t->addExplanationAndIncrementPos(data, 1, "%02X varlen=%d", datalen, datalen);
         }
         string value = bin2hex(data, data_end, datalen);
         int offset = start_parse_here+data-data_start;
         (*values)[key] = { offset, DVEntry(mt, vif&0x7f, storage_nr, tariff, subunit, value) };
         if (value.length() > 0) {
             // This call increments data with datalen.
-            t->addExplanation(data, datalen, "%s", value.c_str());
+            t->addExplanationAndIncrementPos(data, datalen, "%s", value.c_str());
             DEBUG_PARSER("(dvparser debug) data \"%s\"\n\n", value.c_str());
         }
         if (remaining == datalen || data == databytes.end()) {
@@ -279,10 +299,12 @@ bool parseDV(Telegram *t,
 void valueInfoRange(ValueInformation v, int *low, int *hi)
 {
     switch (v) {
-#define X(name,from,to) case ValueInformation::name: *low = from; *hi = to; break;
+    case ValueInformation::None: *low = 0; *hi = 0; return;
+#define X(name,from,to) case ValueInformation::name: *low = from; *hi = to; return;
 LIST_OF_VALUETYPES
 #undef X
     }
+    assert(0);
 }
 
 bool hasKey(std::map<std::string,std::pair<int,DVEntry>> *values, std::string key)
@@ -290,29 +312,35 @@ bool hasKey(std::map<std::string,std::pair<int,DVEntry>> *values, std::string ke
     return values->count(key) > 0;
 }
 
-bool findKey(MeasurementType mit, ValueInformation vif, int storagenr, std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values)
+bool findKey(MeasurementType mit, ValueInformation vif, int storagenr, int tariffnr,
+             std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values)
 {
     int low, hi;
     valueInfoRange(vif, &low, &hi);
 
-    debug("(dvparser) looking for type=%s vif=%s storagenr=%d\n",
-          measurementTypeName(mit).c_str(), ValueInformationName(vif), storagenr);
+    /*debug("(dvparser) looking for type=%s vif=%s storagenr=%d value_ran_low=%02x value_ran_hi=%02x\n",
+          measurementTypeName(mit).c_str(), toString(vif), storagenr,
+          low, hi);*/
 
     for (auto& v : *values)
     {
         MeasurementType ty = v.second.second.type;
         int vi = v.second.second.value_information;
         int sn = v.second.second.storagenr;
-        debug("(dvparser) match? type=%s vif=%s and storagenr=%d\n",
-              measurementTypeName(ty).c_str(), ValueInformationName(vif), storagenr, sn);
+        int tn = v.second.second.tariff;
+        /*debug("(dvparser) match? %s type=%s vif=%02x (%s) and storagenr=%d\n",
+              v.first.c_str(),
+              measurementTypeName(ty).c_str(), vi, toString(toValueInformation(vi)), storagenr, sn);*/
 
         if (vi >= low && vi <= hi
             && (mit == MeasurementType::Unknown || mit == ty)
-            && (storagenr == ANY_STORAGENR || storagenr == sn))
+            && (storagenr == ANY_STORAGENR || storagenr == sn)
+            && (tariffnr == ANY_TARIFFNR || tariffnr == tn))
         {
             *key = v.first;
-            debug("(dvparser) found key %s for type=%s vif=%s storagenr=%d\n",
-                  v.first.c_str(), measurementTypeName(ty).c_str(), ValueInformationName(vif), storagenr);
+            /*debug("(dvparser) found key %s for type=%s vif=%02x (%s) storagenr=%d\n",
+                  v.first.c_str(), measurementTypeName(ty).c_str(),
+                  vi, toString(toValueInformation(vi)), storagenr);*/
             return true;
         }
     }
@@ -386,6 +414,52 @@ bool extractDVuint16(map<string,pair<int,DVEntry>> *values,
     return true;
 }
 
+bool extractDVuint24(map<string,pair<int,DVEntry>> *values,
+                     string key,
+                     int *offset,
+                     uint32_t *value)
+{
+    if ((*values).count(key) == 0) {
+        verbose("(dvparser) warning: cannot extract uint24 from non-existant key \"%s\"\n", key.c_str());
+        *offset = -1;
+        *value = 0;
+        return false;
+    }
+    uchar dif, vif;
+    extractDV(key, &dif, &vif);
+
+    pair<int,DVEntry>&  p = (*values)[key];
+    *offset = p.first;
+    vector<uchar> v;
+    hex2bin(p.second.value, &v);
+
+    *value = v[2] << 16 | v[1]<<8 | v[0];
+    return true;
+}
+
+bool extractDVuint32(map<string,pair<int,DVEntry>> *values,
+                     string key,
+                     int *offset,
+                     uint32_t *value)
+{
+    if ((*values).count(key) == 0) {
+        verbose("(dvparser) warning: cannot extract uint32 from non-existant key \"%s\"\n", key.c_str());
+        *offset = -1;
+        *value = 0;
+        return false;
+    }
+    uchar dif, vif;
+    extractDV(key, &dif, &vif);
+
+    pair<int,DVEntry>&  p = (*values)[key];
+    *offset = p.first;
+    vector<uchar> v;
+    hex2bin(p.second.value, &v);
+
+    *value = v[2] << 16 | v[1]<<8 | v[0];
+    return true;
+}
+
 bool extractDVdouble(map<string,pair<int,DVEntry>> *values,
                      string key,
                      int *offset,
@@ -437,6 +511,24 @@ bool extractDVdouble(map<string,pair<int,DVEntry>> *values,
                 + ((unsigned int)v[2])*256*256
                 + ((unsigned int)v[1])*256
                 + ((unsigned int)v[0]);
+        } else if (t == 0x6) {
+            assert(v.size() == 6);
+            raw = ((uint64_t)v[5])*256*256*256*256*256
+                + ((uint64_t)v[4])*256*256*256*256
+                + ((uint64_t)v[3])*256*256*256
+                + ((uint64_t)v[2])*256*256
+                + ((uint64_t)v[1])*256
+                + ((uint64_t)v[0]);
+        } else if (t == 0x7) {
+            assert(v.size() == 8);
+            raw = ((uint64_t)v[7])*256*256*256*256*256*256*256
+                + ((uint64_t)v[6])*256*256*256*256*256*256
+                + ((uint64_t)v[5])*256*256*256*256*256
+                + ((uint64_t)v[4])*256*256*256*256
+                + ((uint64_t)v[3])*256*256*256
+                + ((uint64_t)v[2])*256*256
+                + ((uint64_t)v[1])*256
+                + ((uint64_t)v[0]);
         }
         double scale = 1.0;
         if (auto_scale) scale = vifScale(vif);

@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2018-2019 Fredrik Öhrström
+ Copyright (C) 2018-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -31,35 +31,25 @@
     X(Volume,0x10,0x17)       \
     X(VolumeFlow,0x38,0x3F) \
     X(FlowTemperature,0x58,0x5B) \
+    X(ReturnTemperature,0x5D,0x5E) \
     X(ExternalTemperature,0x64,0x67) \
     X(HeatCostAllocation,0x6E,0x6E) \
     X(Date,0x6C,0x6C) \
     X(DateTime,0x6D,0x6D) \
-    X(EnergyWh,0x03,0x07) \
+    X(EnergyMJ,0x0E,0x0F) \
+    X(EnergyWh,0x00,0x07) \
     X(PowerW,0x28,0x2f) \
 
 enum class ValueInformation
 {
+    None,
 #define X(name,from,to) name,
 LIST_OF_VALUETYPES
 #undef X
 };
 
-const char *ValueInformatioName(ValueInformation v);
-
-struct DVEntry
-{
-    MeasurementType type {};
-    int value_information {};
-    int storagenr {};
-    int tariff {};
-    int subunit {};
-    string value;
-
-    DVEntry() {}
-    DVEntry(MeasurementType mt, int vi, int st, int ta, int su, string &val) :
-    type(mt), value_information(vi), storagenr(st), tariff(ta), subunit(su), value(val) {}
-};
+const char *toString(ValueInformation v);
+ValueInformation toValueInformation(int i);
 
 bool loadFormatBytesFromSignature(uint16_t format_signature, vector<uchar> *format_bytes);
 
@@ -76,8 +66,11 @@ bool parseDV(Telegram *t,
 // find an existing difvif entry in the values based on the desired value information type.
 // Like: Volume, VolumeFlow, FlowTemperature, ExternalTemperature etc
 // in combination with the storagenr. (Later I will add tariff/subunit)
-bool findKey(MeasurementType mt, ValueInformation vi, int storagenr, std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values);
+bool findKey(MeasurementType mt, ValueInformation vi, int storagenr, int tariffnr,
+             std::string *key, std::map<std::string,std::pair<int,DVEntry>> *values);
+
 #define ANY_STORAGENR -1
+#define ANY_TARIFFNR -1
 
 bool hasKey(std::map<std::string,std::pair<int,DVEntry>> *values, std::string key);
 
@@ -90,6 +83,16 @@ bool extractDVuint16(std::map<std::string,std::pair<int,DVEntry>> *values,
                      std::string key,
                      int *offset,
                      uint16_t *value);
+
+bool extractDVuint24(std::map<std::string,std::pair<int,DVEntry>> *values,
+                     std::string key,
+                     int *offset,
+                     uint32_t *value);
+
+bool extractDVuint32(std::map<std::string,std::pair<int,DVEntry>> *values,
+                     std::string key,
+                     int *offset,
+                     uint32_t *value);
 
 // All volume values are scaled to cubic meters, m3.
 bool extractDVdouble(std::map<std::string,std::pair<int,DVEntry>> *values,

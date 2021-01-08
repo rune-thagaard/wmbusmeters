@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -23,7 +23,7 @@
 #include"util.h"
 
 struct MeterAmiplus : public virtual ElectricityMeter, public virtual MeterCommonImplementation {
-    MeterAmiplus(WMBus *bus, MeterInfo &mi);
+    MeterAmiplus(MeterInfo &mi);
 
     double totalEnergyConsumption(Unit u);
     double currentPowerConsumption(Unit u);
@@ -41,24 +41,12 @@ private:
     string device_date_time_;
 };
 
-MeterAmiplus::MeterAmiplus(WMBus *bus, MeterInfo &mi) :
-    MeterCommonImplementation(bus, mi, MeterType::AMIPLUS, 0)
+MeterAmiplus::MeterAmiplus(MeterInfo &mi) :
+    MeterCommonImplementation(mi, MeterType::AMIPLUS)
 {
-    setEncryptionMode(EncryptionMode::AES_CBC);
-
-    // This is one manufacturer of Amiplus compatible meters.
-    addManufacturer(MANUFACTURER_APA);
-    addMedia(0x02); // Electricity meter
-
-    // This is another manufacturer
-    addManufacturer(MANUFACTURER_DEV);
-    // Oddly, this device has not been configured to send as a electricity meter,
-    // but instead a device/media type that is used for gateway or relays or something?
-    addMedia(0x37); // Radio converter (meter side)
+    setExpectedTPLSecurityMode(TPLSecurityMode::AES_CBC_IV);
 
     addLinkMode(LinkMode::T1);
-
-    setExpectedVersion(0x02);
 
     addPrint("total_energy_consumption", Quantity::Energy,
              [&](Unit u){ return totalEnergyConsumption(u); },
@@ -84,13 +72,11 @@ MeterAmiplus::MeterAmiplus(WMBus *bus, MeterInfo &mi) :
              [&](){ return device_date_time_; },
              "Device date time.",
              false, true);
-
-    MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
 }
 
-unique_ptr<ElectricityMeter> createAmiplus(WMBus *bus, MeterInfo &mi)
+shared_ptr<ElectricityMeter> createAmiplus(MeterInfo &mi)
 {
-    return unique_ptr<ElectricityMeter>(new MeterAmiplus(bus, mi));
+    return shared_ptr<ElectricityMeter>(new MeterAmiplus(mi));
 }
 
 double MeterAmiplus::totalEnergyConsumption(Unit u)
@@ -119,31 +105,28 @@ double MeterAmiplus::currentPowerProduction(Unit u)
 
 void MeterAmiplus::processContent(Telegram *t)
 {
-    map<string,pair<int,DVEntry>> values;
-    parseDV(t, t->content, t->content.begin(), t->content.size(), &values);
-
     int offset;
     string key;
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::EnergyWh, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &total_energy_kwh_);
+    if (findKey(MeasurementType::Unknown, ValueInformation::EnergyWh, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &total_energy_kwh_);
         t->addMoreExplanation(offset, " total energy (%f kwh)", total_energy_kwh_);
     }
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::PowerW, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &current_power_kw_);
+    if (findKey(MeasurementType::Unknown, ValueInformation::PowerW, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &current_power_kw_);
         t->addMoreExplanation(offset, " current power (%f kw)", current_power_kw_);
     }
 
-    extractDVdouble(&values, "0E833C", &offset, &total_energy_returned_kwh_);
+    extractDVdouble(&t->values, "0E833C", &offset, &total_energy_returned_kwh_);
     t->addMoreExplanation(offset, " total energy returned (%f kwh)", total_energy_returned_kwh_);
 
-    extractDVdouble(&values, "0BAB3C", &offset, &current_power_returned_kw_);
+    extractDVdouble(&t->values, "0BAB3C", &offset, &current_power_returned_kw_);
     t->addMoreExplanation(offset, " current power returned (%f kw)", current_power_returned_kw_);
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::DateTime, 0, &key, &values)) {
+    if (findKey(MeasurementType::Unknown, ValueInformation::DateTime, 0, 0, &key, &t->values)) {
         struct tm datetime;
-        extractDVdate(&values, key, &offset, &datetime);
+        extractDVdate(&t->values, key, &offset, &datetime);
         device_date_time_ = strdatetime(&datetime);
         t->addMoreExplanation(offset, " device datetime (%s)", device_date_time_.c_str());
     }

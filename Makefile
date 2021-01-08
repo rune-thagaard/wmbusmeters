@@ -1,4 +1,4 @@
-# Copyright (C) 2017-2019 Fredrik Öhrström
+# Copyright (C) 2017-2020 Fredrik Öhrström
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,43 +20,59 @@
 # make DEBUG=true
 # make DEBUG=true HOST=arm
 
+DESTDIR?=/
+
 ifeq "$(HOST)" "arm"
-    CXX=arm-linux-gnueabihf-g++
-    STRIP=arm-linux-gnueabihf-strip
+    CXX?=arm-linux-gnueabihf-g++
+    STRIP?=arm-linux-gnueabihf-strip
     BUILD=build_arm
-	DEBARCH=armhf
+    DEBARCH=armhf
 else
-    CXX=g++
-    STRIP=strip
+    CXX?=g++
+    STRIP?=strip
 #--strip-unneeded --remove-section=.comment --remove-section=.note
     BUILD=build
-	DEBARCH=amd64
+    DEBARCH=amd64
 endif
 
 ifeq "$(DEBUG)" "true"
-    DEBUG_FLAGS=-O0 -ggdb -fsanitize=address -fno-omit-frame-pointer
+    DEBUG_FLAGS=-O0 -ggdb -fsanitize=address -fno-omit-frame-pointer -fprofile-arcs -ftest-coverage
     STRIP_BINARY=
     BUILD:=$(BUILD)_debug
-    DEBUG_LDFLAGS=-lasan
+    ifneq '' '$(findstring clang++,$(CXX))'
+        DEBUG_LDFLAGS=-fsanitize=address --coverage
+        GCOV?=llvm-cov gcov
+    else
+        DEBUG_LDFLAGS=-lasan -lgcov --coverage
+        GCOV?=gcov
+    endif
 else
     DEBUG_FLAGS=-Os
     STRIP_BINARY=$(STRIP) $(BUILD)/wmbusmeters
+    GCOV=To_run_gcov_add_DEBUG=true
 endif
 
 $(shell mkdir -p $(BUILD))
 
-COMMIT_HASH:=$(shell git log --pretty=format:'%H' -n 1)
-TAG:=$(shell git describe --tags)
-CHANGES:=$(shell git status -s | grep -v '?? ')
-TAG_COMMIT_HASH:=$(shell git show-ref --tags | grep $(TAG) | cut -f 1 -d ' ')
+COMMIT_HASH?=$(shell git log --pretty=format:'%H' -n 1)
+TAG?=$(shell git describe --tags)
+BRANCH?=$(shell git rev-parse --abbrev-ref HEAD)
+CHANGES?=$(shell git status -s | grep -v '?? ')
+TAG_COMMIT_HASH?=$(shell git show-ref --tags | grep $(TAG) | cut -f 1 -d ' ')
+
+ifeq ($(BRANCH),master)
+  BRANCH:=
+else
+  BRANCH:=$(BRANCH)_
+endif
 
 ifeq ($(COMMIT),$(TAG_COMMIT))
   # Exactly on the tagged commit. The version is the tag!
-  VERSION:=$(TAG)
-  DEBVERSION:=$(TAG)
+  VERSION:=$(BRANCH)$(TAG)
+  DEBVERSION:=$(BRANCH)$(TAG)
 else
-  VERSION:=$(TAG)++
-  DEBVERSION:=$(TAG)++
+  VERSION:=$(BRANCH)$(TAG)++
+  DEBVERSION:=$(BRANCH)$(TAG)++
 endif
 
 ifneq ($(strip $(CHANGES)),)
@@ -79,57 +95,102 @@ endif
 
 $(info Building $(VERSION))
 
-CXXFLAGS := $(DEBUG_FLAGS) -fPIC -fmessage-length=0 -std=c++11 -Wall -Wno-unused-function -I$(BUILD)
+CXXFLAGS ?= $(DEBUG_FLAGS) -fPIC -std=c++11 -Wall -Werror=format-security
+CXXFLAGS += -I$(BUILD)
+LDFLAGS  ?= $(DEBUG_LDFLAGS)
+
+USBLIB = -lusb-1.0
+
+ifeq ($(shell uname -s),FreeBSD)
+    CXXFLAGS += -I/usr/local/include
+    LDFLAGS  += -L/usr/local/lib
+    USBLIB    =  -lusb
+endif
 
 $(BUILD)/%.o: src/%.cc $(wildcard src/%.h)
-	@#$(CXX) $(CXXFLAGS) $< -c -E > $@.src
+	$(CXX) $(CXXFLAGS) $< -c -E > $@.src
 	$(CXX) $(CXXFLAGS) $< -MMD -c -o $@
 
 METER_OBJS:=\
 	$(BUILD)/aes.o \
+	$(BUILD)/aescmac.o \
 	$(BUILD)/cmdline.o \
 	$(BUILD)/config.o \
 	$(BUILD)/dvparser.o \
 	$(BUILD)/meters.o \
+	$(BUILD)/meter_amiplus.o \
+	$(BUILD)/meter_apator08.o \
+	$(BUILD)/meter_apator162.o \
+	$(BUILD)/meter_cma12w.o \
+	$(BUILD)/meter_compact5.o \
+	$(BUILD)/meter_ebzwmbe.o \
+	$(BUILD)/meter_ehzp.o \
+	$(BUILD)/meter_esyswm.o \
+	$(BUILD)/meter_em24.o \
+	$(BUILD)/meter_emerlin868.o \
+	$(BUILD)/meter_ev200.o \
+	$(BUILD)/meter_eurisii.o \
+	$(BUILD)/meter_fhkvdataiii.o \
+	$(BUILD)/meter_fhkvdataiv.o \
+	$(BUILD)/meter_flowiq2200.o \
+	$(BUILD)/meter_hydrus.o \
+	$(BUILD)/meter_hydrocalm3.o \
+	$(BUILD)/meter_hydrodigit.o \
+	$(BUILD)/meter_iperl.o \
+	$(BUILD)/meter_izar.o \
+	$(BUILD)/meter_izar3.o \
+	$(BUILD)/meter_lansendw.o \
+	$(BUILD)/meter_lansensm.o \
+	$(BUILD)/meter_lansenth.o \
+	$(BUILD)/meter_lansenpu.o \
+	$(BUILD)/meter_mkradio3.o \
+	$(BUILD)/meter_mkradio4.o \
 	$(BUILD)/meter_multical21.o \
 	$(BUILD)/meter_multical302.o \
+	$(BUILD)/meter_multical403.o \
+	$(BUILD)/meter_multical603.o \
+    $(BUILD)/meter_multical803.o \
 	$(BUILD)/meter_omnipower.o \
-	$(BUILD)/meter_supercom587.o \
-	$(BUILD)/meter_iperl.o \
-	$(BUILD)/meter_eurisii.o \
+	$(BUILD)/meter_q400.o \
 	$(BUILD)/meter_qcaloric.o \
-	$(BUILD)/meter_apator162.o \
-	$(BUILD)/meter_amiplus.o \
-	$(BUILD)/meter_mkradio3.o \
-	$(BUILD)/meter_vario451.o \
-	$(BUILD)/meter_lansenth.o \
 	$(BUILD)/meter_rfmamb.o \
-	$(BUILD)/meter_izar.o \
-	$(BUILD)/meter_hydrus.o \
-	$(BUILD)/meter_hydrodigit.o \
+	$(BUILD)/meter_rfmtx1.o \
+	$(BUILD)/meter_supercom587.o \
+	$(BUILD)/meter_sontex868.o \
+	$(BUILD)/meter_topaseskr.o \
+	$(BUILD)/meter_tsd2.o \
+	$(BUILD)/meter_ultrimis.o \
+	$(BUILD)/meter_vario451.o \
+	$(BUILD)/meter_waterstarm.o \
+	$(BUILD)/meter_whe46x.o \
+	$(BUILD)/meter_sensostar.o \
 	$(BUILD)/printer.o \
+	$(BUILD)/rtlsdr.o \
 	$(BUILD)/serial.o \
 	$(BUILD)/shell.o \
+	$(BUILD)/sha256.o \
+	$(BUILD)/threads.o \
 	$(BUILD)/util.o \
 	$(BUILD)/units.o \
 	$(BUILD)/wmbus.o \
 	$(BUILD)/wmbus_amb8465.o \
 	$(BUILD)/wmbus_im871a.o \
 	$(BUILD)/wmbus_cul.o \
-	$(BUILD)/wmbus_d1tc.o \
 	$(BUILD)/wmbus_rtlwmbus.o \
+	$(BUILD)/wmbus_rtl433.o \
 	$(BUILD)/wmbus_simulator.o \
 	$(BUILD)/wmbus_rawtty.o \
+	$(BUILD)/wmbus_rc1180.o \
 	$(BUILD)/wmbus_utils.o
 
-all: $(BUILD)/wmbusmeters $(BUILD)/testinternals
+all: $(BUILD)/wmbusmeters $(BUILD)/wmbusmeters-admin $(BUILD)/testinternals
 	@$(STRIP_BINARY)
 	@cp $(BUILD)/wmbusmeters $(BUILD)/wmbusmetersd
 
-dist: wmbusmeters_$(DEBVERSION)_$(DEBARCH).deb
+deb: wmbusmeters_$(DEBVERSION)_$(DEBARCH).deb
 
 install: $(BUILD)/wmbusmeters
-	@./install.sh $(BUILD)/wmbusmeters /
+	@./install.sh $(BUILD)/wmbusmeters $(DESTDIR) $(EXTRA_INSTALL_OPTIONS)
 
 uninstall:
 	@./uninstall.sh /
@@ -137,38 +198,56 @@ uninstall:
 wmbusmeters_$(DEBVERSION)_$(DEBARCH).deb:
 	@rm -rf $(BUILD)/debian/wmbusmeters
 	@mkdir -p $(BUILD)/debian/wmbusmeters/DEBIAN
-	@./install.sh --no-adduser $(BUILD)/wmbusmeters $(BUILD)/debian/wmbusmeters
+	@./install.sh $(BUILD)/wmbusmeters $(BUILD)/debian/wmbusmeters --no-adduser
 	@rm -f $(BUILD)/debian/wmbusmeters/DEBIAN/control
 	@echo "Package: wmbusmeters" >> $(BUILD)/debian/wmbusmeters/DEBIAN/control
 	@echo "Version: $(DEBVERSION)" >> $(BUILD)/debian/wmbusmeters/DEBIAN/control
 	@echo "Maintainer: Fredrik Öhrström" >> $(BUILD)/debian/wmbusmeters/DEBIAN/control
 	@echo "Architecture: $(DEBARCH)" >> $(BUILD)/debian/wmbusmeters/DEBIAN/control
 	@echo "Description: A tool to read wireless mbus telegrams from utility meters." >> $(BUILD)/debian/wmbusmeters/DEBIAN/control
+	@for x in preinst postinst prerm postrm ; do \
+		cp scripts/$$x $(BUILD)/debian/wmbusmeters/DEBIAN/ ; \
+		chmod 555 $(BUILD)/debian/wmbusmeters/DEBIAN/$$x ; \
+	done
 	@(cd $(BUILD)/debian; dpkg-deb --build wmbusmeters .)
 	@mv $(BUILD)/debian/wmbusmeters_$(DEBVERSION)_$(DEBARCH).deb .
 	@echo Built package $@
 	@echo But the deb package is not yet working correctly! Work in progress.
 
-$(BUILD)/main.o: $(BUILD)/short_manual.h
+snapcraft:
+	snapcraft --config snap/snapcraft.yaml
+
+$(BUILD)/main.o: $(BUILD)/short_manual.h $(BUILD)/version.h
 
 $(BUILD)/wmbusmeters: $(METER_OBJS) $(BUILD)/main.o $(BUILD)/short_manual.h
-	$(CXX) -o $(BUILD)/wmbusmeters $(METER_OBJS) $(BUILD)/main.o $(DEBUG_LDFLAGS) -lpthread
+	$(CXX) -o $(BUILD)/wmbusmeters $(METER_OBJS) $(BUILD)/main.o $(LDFLAGS) -lrtlsdr $(USBLIB) -lpthread
+
+$(BUILD)/wmbusmeters-admin: $(METER_OBJS) $(BUILD)/admin.o $(BUILD)/ui.o $(BUILD)/short_manual.h
+	$(CXX) -o $(BUILD)/wmbusmeters-admin $(METER_OBJS) $(BUILD)/admin.o $(BUILD)/ui.o $(LDFLAGS) -lmenu -lform -lncurses -lrtlsdr $(USBLIB) -lpthread
 
 $(BUILD)/short_manual.h: README.md
 	echo 'R"MANUAL(' > $(BUILD)/short_manual.h
 	sed -n '/wmbusmeters version/,/```/p' README.md \
-	    | grep -v 'wmbusmeters version' \
-        | grep -v '```' >> $(BUILD)/short_manual.h
+	| grep -v 'wmbusmeters version' \
+	| grep -v '```' >> $(BUILD)/short_manual.h
 	echo ')MANUAL";' >> $(BUILD)/short_manual.h
 
 $(BUILD)/testinternals: $(METER_OBJS) $(BUILD)/testinternals.o
-	$(CXX) -o $(BUILD)/testinternals $(METER_OBJS) $(BUILD)/testinternals.o $(DEBUG_LDFLAGS) -lpthread
+	$(CXX) -o $(BUILD)/testinternals $(METER_OBJS) $(BUILD)/testinternals.o $(LDFLAGS) -lrtlsdr $(USBLIB) -lpthread
 
 $(BUILD)/fuzz: $(METER_OBJS) $(BUILD)/fuzz.o
-	$(CXX) -o $(BUILD)/fuzz $(METER_OBJS) $(BUILD)/fuzz.o $(DEBUG_LDFLAGS) -lpthread
+	$(CXX) -o $(BUILD)/fuzz $(METER_OBJS) $(BUILD)/fuzz.o $(LDFLAGS) -lrtlsdr -lpthread
 
 clean:
 	rm -rf build/* build_arm/* build_debug/* build_arm_debug/* *~
+
+clean_cc:
+	find . -name "*.gcov" -delete
+	find . -name "*.gcda" -delete
+
+gcov:
+	$(GCOV) -o build_debug $(METER_OBJS)
+	mv *.gcov build_debug
 
 test:
 	@./test.sh build/wmbusmeters

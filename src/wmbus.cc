@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -15,15 +15,27 @@
  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include"aescmac.h"
+#include"sha256.h"
+#include"timings.h"
+#include"meters.h"
 #include"wmbus.h"
+#include"wmbus_common_implementation.h"
+#include"wmbus_utils.h"
+#include"dvparser.h"
 #include<assert.h>
+#include<semaphore.h>
 #include<stdarg.h>
 #include<string.h>
 #include<sys/stat.h>
 #include<sys/types.h>
 #include<unistd.h>
 
-struct LinkModeInfo {
+#include<deque>
+#include<algorithm>
+
+struct LinkModeInfo
+{
     LinkMode mode;
     const char *name;
     const char *lcname;
@@ -91,7 +103,8 @@ LinkModeSet parseLinkModes(string m)
     LinkModeSet lms;
     char buf[m.length()+1];
     strcpy(buf, m.c_str());
-    const char *tok = strtok(buf, ",");
+    char *saveptr {};
+    const char *tok = strtok_r(buf, ",", &saveptr);
     while (tok != NULL)
     {
         LinkMode lm = isLinkMode(tok);
@@ -100,18 +113,39 @@ LinkModeSet parseLinkModes(string m)
             error("(wmbus) not a valid link mode: %s\n", tok);
         }
         lms.addLinkMode(lm);
-        tok = strtok(NULL, ",");
+        tok = strtok_r(NULL, ",", &saveptr);
     }
     return lms;
 }
 
-void LinkModeSet::addLinkMode(LinkMode lm)
+bool isValidLinkModes(string m)
+{
+    LinkModeSet lms;
+    char buf[m.length()+1];
+    strcpy(buf, m.c_str());
+    char *saveptr {};
+    const char *tok = strtok_r(buf, ",", &saveptr);
+    while (tok != NULL)
+    {
+        LinkMode lm = isLinkMode(tok);
+        if (lm == LinkMode::UNKNOWN)
+        {
+            return false;
+        }
+        lms.addLinkMode(lm);
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+    return true;
+}
+
+LinkModeSet &LinkModeSet::addLinkMode(LinkMode lm)
 {
     for (auto& s : link_modes_) {
         if (s.mode == lm) {
             set_ |= s.val;
         }
     }
+    return *this;
 }
 
 void LinkModeSet::unionLinkModeSet(LinkModeSet lms)
@@ -185,62 +219,168 @@ LIST_OF_MANUFACTURERS
 
 }
 
-void Telegram::print() {
-    notice("Received telegram from: %02x%02x%02x%02x\n",
-	   a_field_address[0], a_field_address[1], a_field_address[2], a_field_address[3]);
-    notice("          manufacturer: (%s) %s\n",
-           manufacturerFlag(m_field).c_str(),
-	   manufacturer(m_field).c_str());
-    notice("           device type: %s\n",
-	   mediaType(a_field_device_type).c_str());
+void Telegram::print()
+{
+    uchar a=0, b=0, c=0, d=0;
+    if (dll_id.size() >= 4)
+    {
+        a = dll_id[0];
+        b = dll_id[1];
+        c = dll_id[2];
+        d = dll_id[3];
+    }
+    notice("Received telegram from: %02x%02x%02x%02x\n", a,b,c,d);
+    notice("          manufacturer: (%s) %s (0x%02x)\n",
+           manufacturerFlag(dll_mfct).c_str(),
+           manufacturer(dll_mfct).c_str(),
+           dll_mfct);
+    notice("                  type: %s (0x%02x)\n", mediaType(dll_type, dll_mfct).c_str(), dll_type);
+
+    notice("                   ver: 0x%02x\n", dll_version);
+
+    if (about.device != "")
+    {
+        notice("                device: %s\n", about.device.c_str());
+        notice("                  rssi: %d dBm\n", about.rssi_dbm);
+    }
+    string possible_drivers = autoDetectPossibleDrivers();
+    notice("                driver: %s\n", possible_drivers.c_str());
 }
 
-void Telegram::verboseFields() {
-    string man = manufacturerFlag(m_field);
-    verbose(" %02x%02x%02x%02x C-field=%02x M-field=%04x (%s) A-field-version=%02x A-field-dev-type=%02x (%s) Ci-field=%02x (%s)",
-            a_field_address[0], a_field_address[1], a_field_address[2], a_field_address[3],
-            c_field,
-            m_field,
+void Telegram::printDLL()
+{
+    string possible_drivers = autoDetectPossibleDrivers();
+
+    string man = manufacturerFlag(dll_mfct);
+    verbose("(telegram) DLL L=%02x C=%02x (%s) M=%04x (%s) A=%02x%02x%02x%02x VER=%02x TYPE=%02x (%s) (driver %s) DEV=%s RSSI=%d\n",
+            dll_len,
+            dll_c, cType(dll_c).c_str(),
+            dll_mfct,
             man.c_str(),
-            a_field_version,
-            a_field_device_type,
-            mediaType(a_field_device_type).c_str(),
-            ci_field,
-            ciType(ci_field).c_str());
+            dll_id[0], dll_id[1], dll_id[2], dll_id[3],
+            dll_version,
+            dll_type,
+            mediaType(dll_type, dll_mfct).c_str(),
+            possible_drivers.c_str(),
+            about.device.c_str(),
+            about.rssi_dbm);
+}
 
-    if (ci_field == 0x78) {
-        // No data error and no encryption possible.
-    }
+void Telegram::printELL()
+{
+    if (ell_ci == 0) return;
 
-    if (ci_field == 0x72) {
-        // Long tpl header
-        verbose(" CC-field=%02x (%s) long tpl header ACC=%02x SN=%02x%02x%02x%02x",
-                cc_field, ccType(cc_field).c_str(),
-                acc,
-                sn[3],sn[2],sn[1],sn[0]);
-    }
+    string ell_cc_info = ccType(ell_cc);
+    verbose("(telegram) ELL CI=%02x CC=%02x (%s) ACC=%02x",
+            ell_ci, ell_cc, ell_cc_info.c_str(), ell_acc);
 
-    if (ci_field == 0x7a) {
-        // Short data header
-        verbose(" CC-field=%02x (%s) short header ACC=%02x ",
-                cc_field, ccType(cc_field).c_str(),
-                acc,
-                sn[3],sn[2],sn[1],sn[0]);
-    }
+    if (ell_ci == 0x8d || ell_ci == 0x8f)
+    {
+        string ell_sn_info = toStringFromELLSN(ell_sn);
 
-    if (ci_field == 0x8d) {
-        // ELL header
-        verbose(" CC-field=%02x (%s) ell header ACC=%02x SN=%02x%02x%02x%02x",
-                cc_field, ccType(cc_field).c_str(),
-                acc,
-                sn[3],sn[2],sn[1],sn[0]);
+        verbose(" SN=%02x%02x%02x%02x (%s) CRC=%02x%02x",
+                ell_sn_b[0], ell_sn_b[1], ell_sn_b[2], ell_sn_b[3], ell_sn_info.c_str(),
+                ell_pl_crc_b[0], ell_pl_crc_b[1]);
     }
-    if (ci_field == 0x8c) {
-        verbose(" CC-field=%02x (%s) ACC=%02x",
-                cc_field, ccType(cc_field).c_str(),
-                acc);
+    if (ell_ci == 0x8e || ell_ci == 0x8f)
+    {
+        string man = manufacturerFlag(ell_mfct);
+        verbose(" M=%02x%02x (%s) ID=%02x%02x%02x%02x",
+                ell_mfct_b[0], ell_mfct_b[1], man.c_str(),
+                ell_id_b[0], ell_id_b[1], ell_id_b[2], ell_id_b[3]);
     }
     verbose("\n");
+}
+
+void Telegram::printNWL()
+{
+    if (nwl_ci == 0) return;
+
+    verbose("(telegram) NWL CI=%02x\n",
+            nwl_ci);
+}
+
+void Telegram::printAFL()
+{
+    if (afl_ci == 0) return;
+
+    verbose("(telegram) AFL CI=%02x\n",
+            afl_ci);
+
+}
+
+void Telegram::printTPL()
+{
+    if (tpl_ci == 0) return;
+
+    verbose("(telegram) TPL CI=%02x", tpl_ci);
+
+    if (tpl_ci == 0x7a || tpl_ci == 0x72)
+    {
+        string tpl_cfg_info = toStringFromTPLConfig(tpl_cfg);
+        verbose(" ACC=%02x STS=%02x CFG=%04x (%s)",
+                tpl_acc, tpl_sts, tpl_cfg, tpl_cfg_info.c_str());
+    }
+
+    if (tpl_ci == 0x72)
+    {
+        string info = mediaType(tpl_type, tpl_mfct);
+        verbose(" ID=%02x%02x%02x%02x MFT=%02x%02x VER=%02x TYPE=%02x (%s)",
+                tpl_id_b[0], tpl_id_b[1], tpl_id_b[2], tpl_id_b[3],
+                tpl_mfct_b[0], tpl_mfct_b[1],
+                tpl_version, tpl_type, info.c_str());
+    }
+
+    verbose("\n");
+}
+
+// Store the hashes of the last 10 telegrams here.
+deque<SHA256_HASH> seen_telegrams;
+
+bool seen_this_telegram_before(vector<uchar> &frame)
+{
+    SHA256_HASH hash;
+    Sha256Calculate(&frame[0], frame.size(), &hash);
+
+    auto i = std::find(seen_telegrams.begin(), seen_telegrams.end(), hash);
+
+    if (i != seen_telegrams.end())
+    {
+        // Found it!
+        return true;
+    }
+
+    if (seen_telegrams.size() >= 10)
+    {
+        seen_telegrams.pop_front();
+    }
+    seen_telegrams.push_back(hash);
+
+    return false;
+}
+
+// Store the dll_a (6 bytes composed of 4 id + 1 ver + 1 media )
+// for telegrams that has been warned about!
+deque<vector<uchar>> warning_printed_for_telegrams;
+
+bool warned_for_telegram_before(vector<uchar> &dll_a)
+{
+    auto i = std::find(warning_printed_for_telegrams.begin(), warning_printed_for_telegrams.end(), dll_a);
+
+    if (i != warning_printed_for_telegrams.end())
+    {
+        // Found it!
+        return true;
+    }
+
+    // Limit size of memory to 100 odd meters...
+    if (warning_printed_for_telegrams.size() >= 100)
+    {
+        warning_printed_for_telegrams.pop_front();
+    }
+    warning_printed_for_telegrams.push_back(dll_a);
+
+    return false;
 }
 
 string manufacturer(int m_field) {
@@ -262,7 +402,7 @@ string manufacturerFlag(int m_field) {
     return flag;
 }
 
-string mediaType(int a_field_device_type) {
+string mediaType(int a_field_device_type, int m_field) {
     switch (a_field_device_type) {
     case 0: return "Other";
     case 1: return "Oil meter";
@@ -322,19 +462,25 @@ string mediaType(int a_field_device_type) {
     case 0x3D: return "Reserved for system devices";
     case 0x3E: return "Reserved for system devices";
     case 0x3F: return "Reserved for system devices";
+    }
 
-    // Techem MK Radio 3 manufacturer specific.
-    case 0x62: return "Warm water"; // MKRadio3
-    case 0x72: return "Cold water"; // MKRadio3
-
-    // Techem Vario 4 Typ 4.5.1 manufacturer specific.
-    case 0xC3: return "Heat meter";
-
+    if (m_field == MANUFACTURER_TCH)
+    {
+        switch (a_field_device_type) {
+        // Techem MK Radio 3/4 manufacturer specific.
+        case 0x62: return "Warm water"; // MKRadio3/MKRadio4
+        case 0x72: return "Cold water"; // MKRadio3/MKRadio4
+        // Techem FHKV.
+        case 0x80: return "Heat Cost Allocator"; // FHKV data ii/iii
+        // Techem Vario 4 Typ 4.5.1 manufacturer specific.
+        case 0xC3: return "Heat meter";
+        case 0xf0: return "Smoke detector";
+        }
     }
     return "Unknown";
 }
 
-string mediaTypeJSON(int a_field_device_type)
+string mediaTypeJSON(int a_field_device_type, int m_field)
 {
     switch (a_field_device_type) {
     case 0: return "other";
@@ -395,273 +541,178 @@ string mediaTypeJSON(int a_field_device_type)
     case 0x3D: return "reserved";
     case 0x3E: return "reserved";
     case 0x3F: return "reserved";
+    }
 
-    // Techem MK Radio 3 manufacturer specific codes:
-    case 0x62: return "warm water";
-    case 0x72: return "cold water";
-
-    // Techem Vario 4 Typ 4.5.1 manufacturer specific codes:
-    case 0xC3: return "heat";
-
+    if (m_field == MANUFACTURER_TCH)
+    {
+        switch (a_field_device_type) {
+        // Techem MK Radio 3/4 manufacturer specific.
+        case 0x62: return "warm water"; // MKRadio3/MKRadio4
+        case 0x72: return "cold water"; // MKRadio3/MKRadio4
+        // Techem FHKV.
+        case 0x80: return "heat cost allocator"; // FHKV data ii/iii
+        // Techem Vario 4 Typ 4.5.1 manufacturer specific.
+        case 0xC3: return "heat";
+        case 0xf0: return "smoke detector";
+        }
     }
     return "Unknown";
 }
 
-
-bool detectIM871A(string device, SerialCommunicationManager *handler);
-bool detectAMB8465(string device, SerialCommunicationManager *handler);
-bool detectRawTTY(string device, int baud, SerialCommunicationManager *handler);
-bool detectRTLSDR(string device, SerialCommunicationManager *handler);
-bool detectCUL(string device, SerialCommunicationManager *handler);
-
-Detected detectAuto(string devicefile,
-                    string suffix,
-                    SerialCommunicationManager *handler)
-{
-    if (suffix != "")
-    {
-        error("You cannot have a suffix appended to auto.\n");
-    }
-
-    if (detectIM871A("/dev/im871a", handler))
-    {
-        return { DEVICE_IM871A, "/dev/im871a", 0, false };
-    }
-    else
-    {
-        AccessCheck ac = checkIfExistsAndSameGroup("/dev/im871a");
-        if (ac == AccessCheck::NotSameGroup)
-        {
-            // The device exists but we cannot read it!
-            error("You are not in the same group as the device /dev/im871a\n");
-        }
-    }
-
-    if (detectAMB8465("/dev/amb8465", handler))
-    {
-        return { DEVICE_AMB8465, "/dev/amb8465", false };
-    }
-    else
-    {
-        AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
-        if (ac == AccessCheck::NotSameGroup)
-        {
-            // The device exists but we cannot read it!
-            error("You are not in the same group as the device /dev/amb8465\n");
-        }
-    }
-
-    if (detectRawTTY("/dev/rfmrx2", 38400, handler))
-    {
-        return { DEVICE_RFMRX2, "/dev/rfmrx2", false };
-    }
-    else
-    {
-        AccessCheck ac = checkIfExistsAndSameGroup("/dev/rfmrx2");
-        if (ac == AccessCheck::NotSameGroup)
-        {
-            // The device exists but we cannot read it!
-            error("You are not in the same group as the device /dev/rfmrx2\n");
-        }
-    }
-
-    if (detectRTLSDR("/dev/rtlsdr", handler))
-    {
-        return { DEVICE_RTLWMBUS, "rtlwmbus" };
-    }
-    else
-    {
-        AccessCheck ac = checkIfExistsAndSameGroup("/dev/amb8465");
-        if (ac == AccessCheck::NotSameGroup)
-        {
-            // The device exists but we cannot read it!
-            error("You are not in the same group as the device /dev/rtlsdr\n");
-        }
-    }
-
-    if (detectCUL("/dev/ttyUSB0", handler))
-    {
-        return { DEVICE_CUL, "/dev/ttyUSB0" };
-    }
-    else
-    {
-        AccessCheck ac = checkIfExistsAndSameGroup("/dev/ttyUSB0");
-        if (ac == AccessCheck::NotSameGroup)
-        {
-            // The device exists but we cannot read it!
-            error("You are not in the same group as the device CUL\n");
-        }
-    }
-
-    // We could not auto-detect any device.
-    return { DEVICE_UNKNOWN, "", false };
-}
-
-Detected detectImstAmberCul(string devicefile,
-                            string suffix,
-                            SerialCommunicationManager *handler)
-{
-    // If im87a is tested first, a delay of 1s must be inserted
-    // before amb8465 is tested, lest it will not respond properly.
-    // It really should not matter, but perhaps is the uart of the amber
-    // confused by the 57600 speed....or maybe there is some other reason.
-    // Anyway by testing for the amb8465 first, we can immediately continue
-    // with the test for the im871a, without the need for a 1s delay.
-
-    // Talk amb8465 with it...
-    // assumes this device is configured for 9600 bps, which seems to be the default.
-    if (detectAMB8465(devicefile, handler))
-    {
-        return { DEVICE_AMB8465, devicefile, false };
-    }
-    // Talk im871a with it...
-    // assumes this device is configured for 57600 bps, which seems to be the default.
-    if (detectIM871A(devicefile, handler))
-    {
-        return { DEVICE_IM871A, devicefile, false };
-    }
-    // Talk CUL with it...
-    // assumes this device is configured for 38400 bps, which seems to be the default.
-    if (detectCUL(devicefile, handler))
-    {
-        return { DEVICE_CUL, devicefile, false };
-    }
-
-    // We could not auto-detect either.
-    return { DEVICE_UNKNOWN, "", false };
-}
-
-/**
-  The devicefile can be:
-
-  auto (to autodetect the device)
-  /dev/ttyUSB0 (to use this character device)
-  /home/me/simulation.txt or /home/me/simulation_foo.txt (to use the wmbusmeters telegram=|....|+32 format)
-  /home/me/telegram.raw (to read bytes from this file)
-  stdin (to read bytes from stdin)
-
-  If a suffix the suffix can be:
-  im871a
-  amb8465
-  rfmrx2
-  cul
-  d1tc
-  rtlwmbus: the devicefile produces rtlwmbus messages, ie. T1;1;1;2019-04-03 19:00:42.000;97;148;88888888;0x6e440106...ae03a77
-  simulation: assume the devicefile produces telegram=|....|+xx lines. This can also pace the simulated telegrams in time.
-  a baud rate like 38400: assume the devicefile is a raw tty character device.
+/*
+    X(0x72, TPL_72,  "TPL: APL follows", return "EN 13757-3 Application Layer (long tplh)";
+    case 0x73: return "EN 13757-3 Application Layer with Compact frame and long Transport Layer";
 */
-Detected detectWMBusDeviceSetting(string devicefile,
-                                  string suffix,
-                                  SerialCommunicationManager *handler)
+
+#define LIST_OF_CI_FIELDS \
+    X(0x51, TPL_51,  "TPL: APL follows", 0, CI_TYPE::TPL, "")       \
+    X(0x72, TPL_72,  "TPL: long header APL follows", 0, CI_TYPE::TPL, "") \
+    X(0x78, TPL_78,  "TPL: no header APL follows", 0, CI_TYPE::TPL, "") \
+    X(0x79, TPL_79,  "TPL: compact APL follows", 0, CI_TYPE::TPL, "") \
+    X(0x7A, TPL_7A,  "TPL: short header APL follows", 0, CI_TYPE::TPL, "") \
+    X(0x8C, ELL_I,   "ELL: I",    2, CI_TYPE::ELL, "CC, ACC") \
+    X(0x8D, ELL_II,  "ELL: II",   8, CI_TYPE::ELL, "CC, ACC, SN, Payload CRC") \
+    X(0x8E, ELL_III, "ELL: III", 10, CI_TYPE::ELL, "CC, ACC, M2, A2") \
+    X(0x8F, ELL_IV,  "ELL: IV",  16, CI_TYPE::ELL, "CC, ACC, M2, A2, SN, Payload CRC") \
+    X(0x86, ELL_V,   "ELL: V",   -1, CI_TYPE::ELL, "Variable length") \
+    X(0x90, AFL,     "AFL", 10, CI_TYPE::AFL, "") \
+    X(0xA0, MFCT_SPECIFIC_A0, "MFCT SPECIFIC", 0, CI_TYPE::TPL, "") \
+    X(0xA1, MFCT_SPECIFIC_A1, "MFCT SPECIFIC", 0, CI_TYPE::TPL, "") \
+    X(0xA2, MFCT_SPECIFIC_A2, "MFCT SPECIFIC", 0, CI_TYPE::TPL, "")
+
+enum CI_Field_Values {
+#define X(val,name,cname,len,citype,explain) name = val,
+LIST_OF_CI_FIELDS
+#undef X
+};
+
+bool isCiFieldOfType(int ci_field, CI_TYPE type)
 {
-    debug("(detect) \"%s\" \"%s\"\n", devicefile.c_str(), suffix.c_str());
-    // Look for /dev/im871a /dev/amb8465 /dev/rfmrx2 /dev/rtlsdr
-    if (devicefile == "auto")
-    {
-        debug("(detect) driver: auto\n");
-        return detectAuto(devicefile, suffix, handler);
-    }
-
-    // If the devicefile is rtlwmbus then the suffix can be a frequency
-    // or the actual command line to use.
-    // E.g. rtlwmbus rtlwmbux:868.95M rtlwmbus:rtl_sdr | rtl_wmbus
-    if (devicefile == "rtlwmbus")
-    {
-        debug("(detect) driver: rtlwmbus\n");
-        return { DEVICE_RTLWMBUS, "", false };
-    }
-
-    // Is it a file named simulation_xxx.txt ?
-    if (checkIfSimulationFile(devicefile.c_str()))
-    {
-        debug("(detect) driver: simulation file\n");
-        return { DEVICE_SIMULATOR, devicefile, false };
-    }
-
-    bool is_tty = checkCharacterDeviceExists(devicefile.c_str(), false);
-    bool is_stdin = devicefile == "stdin";
-    bool is_file = checkFileExists(devicefile.c_str());
-
-    debug("(detect) is_tty=%d is_stdin=%d is_file=%d\n", is_tty, is_stdin, is_file);
-    if (!is_tty && !is_stdin && !is_file)
-    {
-        debug("(detect) not a valid device file %s\n", devicefile.c_str());
-        // Oups, not a valid devicefile.
-        return { DEVICE_UNKNOWN, "", false };
-    }
-
-    bool override_tty = !is_tty;
-
-    if (suffix == "amb8465") return { DEVICE_AMB8465, devicefile, 0, override_tty };
-    if (suffix == "im871a") return { DEVICE_IM871A, devicefile, 0, override_tty };
-    if (suffix == "rfmrx2") return { DEVICE_RFMRX2, devicefile, 0, override_tty };
-    if (suffix == "rtlwmbus") return { DEVICE_RTLWMBUS, devicefile, 0, override_tty };
-    if (suffix == "cul") return { DEVICE_CUL, devicefile, 0, override_tty };
-    if (suffix == "d1tc") return { DEVICE_D1TC, devicefile, 0, override_tty };
-    if (suffix == "simulation") return { DEVICE_SIMULATOR, devicefile, 0, override_tty };
-
-    // If the suffix is a number, then assume that it is a baud rate.
-    if (isNumber(suffix)) return { DEVICE_RAWTTY, devicefile, atoi(suffix.c_str()), override_tty };
-
-    // If the suffix is empty and its not a tty, then read raw telegrams from stdin or the file.
-    if (suffix == "" && !is_tty) return { DEVICE_RAWTTY, devicefile, 0, true };
-
-    if (suffix != "")
-    {
-        error("Unknown device suffix %s\n", suffix.c_str());
-    }
-
-    // Ok, we are left with a single /dev/ttyUSB0 lets talk to it
-    // to figure out what is connected to it. We currently only
-    // know how to detect Imst, Amber or CUL dongles.
-    return detectImstAmberCul(devicefile, suffix, handler);
+#define X(val,name,cname,len,citype,explain) if (ci_field == val && type == citype) return true;
+LIST_OF_CI_FIELDS
+#undef X
+    return false;
 }
 
+int ciFieldLength(int ci_field)
+{
+#define X(val,name,cname,len,citype,explain) if (ci_field == val) return len;
+LIST_OF_CI_FIELDS
+#undef X
+    return -2;
+}
 
 string ciType(int ci_field)
 {
     if (ci_field >= 0xA0 && ci_field <= 0xB7) {
         return "Mfct specific";
     }
+    if (ci_field >= 0x00 && ci_field <= 0x1f) {
+        return "Reserved for DLMS";
+    }
+
+    if (ci_field >= 0x20 && ci_field <= 0x4f) {
+        return "Reserved";
+    }
+
     switch (ci_field) {
-    case 0x60: return "COSEM Data sent by the Readout device to the meter with long Transport Layer";
-    case 0x61: return "COSEM Data sent by the Readout device to the meter with short Transport Layer";
-    case 0x64: return "Reserved for OBIS-based Data sent by the Readout device to the meter with long Transport Layer";
-    case 0x65: return "Reserved for OBIS-based Data sent by the Readout device to the meter with short Transport Layer";
-    case 0x69: return "EN 13757-3 Application Layer with Format frame and no Transport Layer";
-    case 0x6A: return "EN 13757-3 Application Layer with Format frame and with short Transport Layer";
-    case 0x6B: return "EN 13757-3 Application Layer with Format frame and with long Transport Layer";
-    case 0x6C: return "Clock synchronisation (absolute)";
-    case 0x6D: return "Clock synchronisation (relative)";
-    case 0x6E: return "Application error from device with short Transport Layer";
-    case 0x6F: return "Application error from device with long Transport Layer";
+    case 0x50: return "Application reset or select to device (no tplh)";
+    case 0x51: return "Command to device (no tplh)"; // Only for mbus, not wmbus.
+    case 0x52: return "Selection of device (no tplh)";
+    case 0x53: return "Application reset or select to device (long tplh)";
+    case 0x54: return "Request of selected application to device (no tplh)";
+    case 0x55: return "Request of selected application to device (long tplh)";
+    case 0x56: return "Reserved";
+    case 0x57: return "Reserved";
+    case 0x58: return "Reserved";
+    case 0x59: return "Reserved";
+    case 0x5a: return "Command to device (short tplh)";
+    case 0x5b: return "Command to device (long tplh)";
+    case 0x5c: return "Sync action (no tplh)";
+    case 0x5d: return "Reserved";
+    case 0x5e: return "Reserved";
+    case 0x5f: return "Specific usage";
+    case 0x60: return "COSEM Data sent by the Readout device to the meter (long tplh)";
+    case 0x61: return "COSEM Data sent by the Readout device to the meter (short tplh)";
+    case 0x62: return "?";
+    case 0x63: return "?";
+    case 0x64: return "Reserved for OBIS-based Data sent by the Readout device to the meter (long tplh)";
+    case 0x65: return "Reserved for OBIS-based Data sent by the Readout device to the meter (short tplh)";
+    case 0x66: return "Response of selected application from device (no tplh)";
+    case 0x67: return "Response of selected application from device (short tplh)";
+    case 0x68: return "Response of selected application from device (long tplh)";
+    case 0x69: return "EN 13757-3 Application Layer with Format frame (no tplh)";
+    case 0x6A: return "EN 13757-3 Application Layer with Format frame (short tplh)";
+    case 0x6B: return "EN 13757-3 Application Layer with Format frame (long tplh)";
+    case 0x6C: return "Clock synchronisation (absolute) (long tplh)";
+    case 0x6D: return "Clock synchronisation (relative) (long tplh)";
+    case 0x6E: return "Application error from device (short tplh)";
+    case 0x6F: return "Application error from device (long tplh)";
     case 0x70: return "Application error from device without Transport Layer";
     case 0x71: return "Reserved for Alarm Report";
-    case 0x72: return "EN 13757-3 Application Layer with long Transport Layer";
+    case 0x72: return "EN 13757-3 Application Layer (long tplh)";
     case 0x73: return "EN 13757-3 Application Layer with Compact frame and long Transport Layer";
-    case 0x74: return "Alarm from device with short Transport Layer";
-    case 0x75: return "Alarm from device with long Transport Layer";
-    case 0x78: return "EN 13757-3 Application Layer without Transport Layer (to be defined)";
-    case 0x79: return "EN 13757-3 Application Layer with Compact frame and no header";
-    case 0x7A: return "EN 13757-3 Application Layer with short Transport Layer";
-    case 0x7B: return "EN 13757-3 Application Layer with Compact frame and short header";
-    case 0x7C: return "COSEM Application Layer with long Transport Layer";
-    case 0x7D: return "COSEM Application Layer with short Transport Layer";
-    case 0x7E: return "Reserved for OBIS-based Application Layer with long Transport Layer";
-    case 0x7F: return "Reserved for OBIS-based Application Layer with short Transport Layer";
-    case 0x80: return "EN 13757-3 Transport Layer (long) from other device to the meter";
+    case 0x74: return "Alarm from device (short tplh)";
+    case 0x75: return "Alarm from device (long tplh)";
+    case 0x76: return "?";
+    case 0x77: return "?";
+    case 0x78: return "EN 13757-3 Application Layer (no tplh)";
+    case 0x79: return "EN 13757-3 Application Layer with Compact frame (no tplh)";
+    case 0x7A: return "EN 13757-3 Application Layer (short tplh)";
+    case 0x7B: return "EN 13757-3 Application Layer with Compact frame (short tplh)";
+    case 0x7C: return "COSEM Application Layer (long tplh)";
+    case 0x7D: return "COSEM Application Layer (short tplh)";
+    case 0x7E: return "Reserved for OBIS-based Application Layer (long tplh)";
+    case 0x7F: return "Reserved for OBIS-based Application Layer (short tplh)";
+    case 0x80: return "EN 13757-3 Transport Layer (long tplh) from other device to the meter";
+
     case 0x81: return "Network Layer data";
-    case 0x82: return "For future use";
-    case 0x83: return "Network Management application";
-    case 0x8A: return "EN 13757-3 Transport Layer (short) from the meter to the other device";
-    case 0x8B: return "EN 13757-3 Transport Layer (long) from the meter to the other device";
-    case 0x8C: return "Extended Link Layer I (2 Byte)";
-    case 0x8D: return "Extended Link Layer II (8 Byte)";
+    case 0x82: return "Network management data to device (short tplh)";
+    case 0x83: return "Network Management data to device (no tplh)";
+    case 0x84: return "Transport layer to device (compact frame) (long tplh)";
+    case 0x85: return "Transport layer to device (format frame) (long tplh)";
+    case 0x86: return "Extended Link Layer V (variable length)";
+    case 0x87: return "Network management data from device (long tplh)";
+    case 0x88: return "Network management data from device (short tplh)";
+    case 0x89: return "Network management data from device (no tplh)";
+    case 0x8A: return "EN 13757-3 Transport Layer (short tplh) from the meter to the other device"; // No application layer, e.g. ACK
+    case 0x8B: return "EN 13757-3 Transport Layer (long tplh) from the meter to the other device"; // No application layer, e.g. ACK
+
+    case 0x8C: return "ELL: Extended Link Layer I (2 Byte)"; // CC, ACC
+    case 0x8D: return "ELL: Extended Link Layer II (8 Byte)"; // CC, ACC, SN, Payload CRC
+    case 0x8E: return "ELL: Extended Link Layer III (10 Byte)"; // CC, ACC, M2, A2
+    case 0x8F: return "ELL: Extended Link Layer IV (16 Byte)"; // CC, ACC, M2, A2, SN, Payload CRC
+
+    case 0x90: return "AFL: Authentication and Fragmentation Sublayer";
+    case 0x91: return "Reserved";
+    case 0x92: return "Reserved";
+    case 0x93: return "Reserved";
+    case 0x94: return "Reserved";
+    case 0x95: return "Reserved";
+    case 0x96: return "Reserved";
+    case 0x97: return "Reserved";
+    case 0x98: return "?";
+    case 0x99: return "?";
+
+    case 0xB8: return "Set baud rate to 300";
+    case 0xB9: return "Set baud rate to 600";
+    case 0xBA: return "Set baud rate to 1200";
+    case 0xBB: return "Set baud rate to 2400";
+    case 0xBC: return "Set baud rate to 4800";
+    case 0xBD: return "Set baud rate to 9600";
+    case 0xBE: return "Set baud rate to 19200";
+    case 0xBF: return "Set baud rate to 38400";
+    case 0xC0: return "Image transfer to device (long tplh)";
+    case 0xC1: return "Image transfer from device (short tplh)";
+    case 0xC2: return "Image transfer from device (long tplh)";
+    case 0xC3: return "Security info transfer to device (long tplh)";
+    case 0xC4: return "Security info transfer from device (short tplh)";
+    case 0xC5: return "Security info transfer from device (long tplh)";
     }
     return "?";
 }
 
-void Telegram::addExplanation(vector<uchar>::iterator &bytes, int len, const char* fmt, ...)
+void Telegram::addExplanationAndIncrementPos(vector<uchar>::iterator &pos, int len, const char* fmt, ...)
 {
     char buf[1024];
     buf[1023] = 0;
@@ -672,8 +723,8 @@ void Telegram::addExplanation(vector<uchar>::iterator &bytes, int len, const cha
     va_end(args);
 
     explanations.push_back({parsed.size(), buf});
-    parsed.insert(parsed.end(), bytes, bytes+len);
-    bytes += len;
+    parsed.insert(parsed.end(), pos, pos+len);
+    pos += len;
 }
 
 void Telegram::addMoreExplanation(int pos, const char* fmt, ...)
@@ -703,212 +754,939 @@ void Telegram::addMoreExplanation(int pos, const char* fmt, ...)
     }
 }
 
-bool Telegram::parse(vector<uchar> &frame)
+bool expectedMore(int line)
 {
-    vector<uchar>::iterator bytes = frame.begin();
-    parsed.clear();
-    if (frame.size() == 0) return false;
-    if (frame.size() < 11)
+    verbose("(wmbus) parser expected more data! (%d)\n", line);
+    return false;
+}
+
+bool Telegram::parseDLL(vector<uchar>::iterator &pos)
+{
+    int remaining = distance(pos, frame.end());
+    if (remaining == 0) return expectedMore(__LINE__);
+
+    debug("(wmbus) parseDLL @%d %d\n", distance(frame.begin(), pos), remaining);
+    dll_len = *pos;
+    if (remaining < dll_len) return expectedMore(__LINE__);
+    addExplanationAndIncrementPos(pos, 1, "%02x length (%d bytes)", dll_len, dll_len);
+
+    dll_c = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x dll-c (%s)", dll_c, cType(dll_c).c_str());
+
+    dll_mfct_b[0] = *(pos+0);
+    dll_mfct_b[1] = *(pos+1);
+    dll_mfct = dll_mfct_b[1] <<8 | dll_mfct_b[0];
+    string man = manufacturerFlag(dll_mfct);
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x dll-mfct (%s)",
+                                  dll_mfct_b[0], dll_mfct_b[1], man.c_str());
+
+    dll_a.resize(6);
+    dll_id.resize(4);
+    for (int i=0; i<6; ++i)
     {
-        verbose("(wmbus) cannot parse telegram with length %zu\n", frame.size());
+        dll_a[i] = *(pos+i);
+        if (i<4)
+        {
+            dll_id_b[i] = *(pos+i);
+            dll_id[i] = *(pos+3-i);
+        }
+    }
+    strprintf(id, "%02x%02x%02x%02x", *(pos+3), *(pos+2), *(pos+1), *(pos+0));
+    addExplanationAndIncrementPos(pos, 4, "%02x%02x%02x%02x dll-id (%s)",
+                                  *(pos+0), *(pos+1), *(pos+2), *(pos+3), id.c_str());
+
+    dll_version = *(pos+0);
+    dll_type = *(pos+1);
+    addExplanationAndIncrementPos(pos, 1, "%02x dll-version", dll_version);
+    addExplanationAndIncrementPos(pos, 1, "%02x dll-type (%s)", dll_type,
+                                  mediaType(dll_type, dll_mfct).c_str());
+
+    return true;
+}
+
+string Telegram::toStringFromELLSN(int sn)
+{
+    int session = (sn >> 0)  & 0x0f; // lowest 4 bits
+    int time = (sn >> 4)  & 0x1ffffff; // next 25 bits
+    int sec  = (sn >> 29) & 0x7; // next 3 bits.
+    string info;
+    ELLSecurityMode esm = fromIntToELLSecurityMode(sec);
+    info += toString(esm);
+    info += " session=";
+    info += to_string(session);
+    info += " time=";
+    info += to_string(time);
+    return info;
+}
+
+bool Telegram::parseELL(vector<uchar>::iterator &pos)
+{
+    int remaining = distance(pos, frame.end());
+    if (remaining == 0) return false;
+
+    debug("(wmbus) parseELL @%d %d\n", distance(frame.begin(), pos), remaining);
+    int ci_field = *pos;
+    if (!isCiFieldOfType(ci_field, CI_TYPE::ELL)) return true;
+    addExplanationAndIncrementPos(pos, 1, "%02x ell-ci-field (%s)",
+                                  ci_field, ciType(ci_field).c_str());
+    ell_ci = ci_field;
+    int len = ciFieldLength(ell_ci);
+
+    if (remaining < len+1) return expectedMore(__LINE__);
+
+    // All ELL:s (including ELL I) start with cc,acc.
+
+    ell_cc = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x ell-cc (%s)", ell_cc, ccType(ell_cc).c_str());
+
+    ell_acc = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x ell-acc", ell_acc);
+
+    bool has_target_mft_address = false;
+    bool has_session_number_pl_crc = false;
+
+    switch (ell_ci)
+    {
+    case CI_Field_Values::ELL_I:
+        // Already handled above.
+        break;
+    case CI_Field_Values::ELL_II:
+        has_session_number_pl_crc = true;
+        break;
+    case CI_Field_Values::ELL_III:
+        has_target_mft_address = true;
+        break;
+    case CI_Field_Values::ELL_IV:
+        has_session_number_pl_crc = true;
+        has_target_mft_address = true;
+        break;
+    case CI_Field_Values::ELL_V:
+        verbose("ELL V not yet handled\n");
         return false;
     }
-    len = frame[0];
-    if ((int)len+1 > (int)frame.size())
-    {
-        // I have some bad test data, that needs to be cleaned out...
-        verbose("(wmbus) error not enough bytes frame=%zu but len=%zu\n", frame.size(), len);
-    }
-    if ((int)len+1 != (int)frame.size())
-    {
-        // I have some bad test data, that needs to be cleaned out...
-        verbose("(wmbus) discrepancy frame=%zu should be len=%zu\n", frame.size(), len);
-    }
-    addExplanation(bytes, 1, "%02x length (%d bytes)", len, len);
-    c_field = frame[1];
-    addExplanation(bytes, 1, "%02x c-field (%s)", c_field, cType(c_field).c_str());
-    m_field = frame[3]<<8 | frame[2];
-    string man = manufacturerFlag(m_field);
-    addExplanation(bytes, 2, "%02x%02x m-field (%02x=%s)", frame[2], frame[3], m_field, man.c_str());
-    a_field.resize(6);
-    a_field_address.resize(4);
-    for (int i=0; i<6; ++i) {
-        a_field[i] = frame[4+i];
-        if (i<4) { a_field_address[i] = frame[4+3-i]; }
-    }
-    addExplanation(bytes, 4, "%02x%02x%02x%02x a-field-addr (%02x%02x%02x%02x)", frame[4], frame[5], frame[6], frame[7],
-                   frame[7], frame[6], frame[5], frame[4]);
 
-    strprintf(id, "%02x%02x%02x%02x", frame[7], frame[6], frame[5], frame[4]);
-    a_field_version = frame[4+4];
-    a_field_device_type = frame[4+5];
-    addExplanation(bytes, 1, "%02x a-field-version", frame[8]);
-    addExplanation(bytes, 1, "%02x a-field-type (%s)", frame[9], mediaType(a_field_device_type).c_str());
+    if (has_target_mft_address)
+    {
+        ell_mfct_b[0] = *(pos+0);
+        ell_mfct_b[1] = *(pos+1);
+        ell_mfct = ell_mfct_b[1] << 8 | ell_mfct_b[0];
+        string man = manufacturerFlag(ell_mfct);
+        addExplanationAndIncrementPos(pos, 2, "%02x%02x ell-mfct (%s)",
+                                      ell_mfct_b[0], ell_mfct_b[1], man.c_str());
 
-    ci_field=frame[10];
-    addExplanation(bytes, 1, "%02x ci-field (%s)", ci_field, ciType(ci_field).c_str());
+        ell_id_found = true;
+        ell_id_b[0] = *(pos+0);
+        ell_id_b[1] = *(pos+1);
+        ell_id_b[2] = *(pos+2);
+        ell_id_b[3] = *(pos+3);
 
-    int header_size = 0;
-    if (ci_field == 0x78)
-    {
-        header_size = 0; // And no encryption possible.
-    }
-    else if (ci_field == 0x72)
-    {
-        if (frame.size() < 22)
-        {
-            verbose("(wmbus) cannot parse telegram ci=0x72 with length %zu\n", frame.size());
-            return false;
-        }
+        addExplanationAndIncrementPos(pos, 4, "%02x%02x%02x%02x ell-id",
+                                      ell_id_b[0], ell_id_b[1], ell_id_b[2], ell_id_b[3]);
 
-        // Example, begins aith frame[11]: 99999999 MMMM VV TT 01 00 0000
-        // Ignore 4 id bytes for now, should perhaps check that they are identical with the id.
-        // But if they are not, what to do?
-        // Ignore 2 mfc bytes for now, check if same as above?
-        // Ignore 1 version byte.
-        // Ignore 1 dev type byte.
-        acc = frame[18];
-        addExplanation(bytes, 1, "%02x acc", acc);
-        status = frame[19];
-        addExplanation(bytes, 1, "%02x status ()", status);
-        config_field = frame[20]<<8 | frame[21];
-        string config_info = "";
-        if (config_field & 0x0f) {
-            config_info += "encrypted ";
-            is_encrypted_ = true;
-        }
-        if ((config_field & 0x0f) == 0 || (config_field & 0x0f) == 0x05) {
-            if ((config_field & 0x0f) == 0x05) config_info += "AES_CBC ";
-            if (config_field & 0x80) config_info += "bidirectional ";
-            if (config_field & 0x40) config_info += "accessibility ";
-            if (config_field & 0x20) config_info += "synchronous ";
-        }
-        if (config_info.length() > 0) config_info.pop_back();
-        addExplanation(bytes, 2, "%02x%02x config (%s)", frame[13], frame[14], config_info.c_str());
-        header_size = 4+8;
+        ell_version = *pos;
+        addExplanationAndIncrementPos(pos, 1, "%02x ell-version", ell_version);
+
+        ell_type = *pos;
+        addExplanationAndIncrementPos(pos, 1, "%02x ell-type");
     }
-    else if (ci_field == 0x7a)
+
+    if (has_session_number_pl_crc)
     {
-        if (frame.size() < 15)
+        string sn_info;
+        ell_sn_b[0] = *(pos+0);
+        ell_sn_b[1] = *(pos+1);
+        ell_sn_b[2] = *(pos+2);
+        ell_sn_b[3] = *(pos+3);
+        ell_sn = ell_sn_b[3]<<24 | ell_sn_b[2]<<16 | ell_sn_b[1] << 8 | ell_sn_b[0];
+
+        ell_sn_session = (ell_sn >> 0)  & 0x0f; // lowest 4 bits
+        ell_sn_time = (ell_sn >> 4)  & 0x1ffffff; // next 25 bits
+        ell_sn_sec = (ell_sn >> 29) & 0x7; // next 3 bits.
+        ell_sec_mode = fromIntToELLSecurityMode(ell_sn_sec);
+        string info = toString(ell_sec_mode);
+        addExplanationAndIncrementPos(pos, 4, "%02x%02x%02x%02x sn (%s)",
+                                      ell_sn_b[0], ell_sn_b[1], ell_sn_b[2], ell_sn_b[3], info.c_str());
+
+        if (ell_sec_mode == ELLSecurityMode::AES_CTR)
         {
-            verbose("(wmbus) cannot parse telegram ci=0x7a with length %zu\n", frame.size());
-            return false;
-        }
-        acc = frame[11];
-        addExplanation(bytes, 1, "%02x acc", acc);
-        status = frame[12];
-        addExplanation(bytes, 1, "%02x status ()", status);
-        config_field = frame[13]<<8 | frame[14];
-        string config_info = "";
-        if (config_field & 0x0f) {
-            config_info += "encrypted ";
-            is_encrypted_ = true;
-        }
-        if ((config_field & 0x0f) == 0 || (config_field & 0x0f) == 0x05) {
-            if ((config_field & 0x0f) == 0x05) config_info += "AES_CBC ";
-            if (config_field & 0x80) config_info += "bidirectional ";
-            if (config_field & 0x40) config_info += "accessibility ";
-            if (config_field & 0x20) config_info += "synchronous ";
-        }
-        if (config_info.length() > 0) config_info.pop_back();
-        addExplanation(bytes, 2, "%02x%02x config (%s)", frame[13], frame[14], config_info.c_str());
-        header_size = 4;
-    }
-    else if (ci_field == 0x8d || ci_field == 0x8c)
-    {
-        if (frame.size() < 13)
-        {
-            verbose("(wmbus) cannot parse telegram ci=0x8d or 0x8c with length %zu\n", frame.size());
-            return false;
-        }
-        cc_field = frame[11];
-        addExplanation(bytes, 1, "%02x cc-field (%s)", cc_field, ccType(cc_field).c_str());
-        acc = frame[12];
-        addExplanation(bytes, 1, "%02x acc", acc);
-        header_size = 2;
-        if (ci_field == 0x8d)
-        {
-            if (frame.size() < 17)
+            bool decrypt_ok = decrypt_ELL_AES_CTR(this, frame, pos, meter_keys->confidentiality_key);
+            // Actually this ctr decryption always succeeds, if wrong key, it will decrypt to garbage.
+            if (!decrypt_ok)
             {
-                verbose("(wmbus) cannot parse telegram ci=0x8d with length %zu\n", frame.size());
+                decryption_failed = true;
+                return true;
+            }
+            // Now the frame from pos and onwards has been decrypted, perhaps.
+        }
+
+        ell_pl_crc_b[0] = *(pos+0);
+        ell_pl_crc_b[1] = *(pos+1);
+        ell_pl_crc = (ell_pl_crc_b[1] << 8) | ell_pl_crc_b[0];
+
+        int dist = distance(frame.begin(), pos+2);
+        int len = distance(pos+2, frame.end());
+        uint16_t check = crc16_EN13757(&(frame[dist]), len);
+
+        addExplanationAndIncrementPos(pos, 2, "%02x%02x payload crc (calculated %02x%02x %s)",
+                                      ell_pl_crc_b[0], ell_pl_crc_b[1],
+                                      check  & 0xff, check >> 8, (ell_pl_crc==check?"OK":"ERROR"));
+
+        if (ell_pl_crc != check)
+        {
+            // Ouch, checksum of the payload does not match.
+            // A wrong key was probably used for decryption.
+            decryption_failed = true;
+            if (parser_warns_)
+            {
+                if (isVerboseEnabled() || isDebugEnabled() || !warned_for_telegram_before(dll_a))
+                {
+                    // Print this warning only once! Unless you are using verbose or debug.
+                    warning("(wmbus) decrypted payload crc failed check, did you use the correct decryption key? "
+                            "Permanently ignoring telegrams from id: %02x%02x%02x%02x mfct: (%s) %s (0x%02x) type: %s (0x%02x) ver: 0x%02x\n",
+                            dll_id_b[3], dll_id_b[2], dll_id_b[1], dll_id_b[0],
+                            manufacturerFlag(dll_mfct).c_str(),
+                            manufacturer(dll_mfct).c_str(),
+                            dll_mfct,
+                            mediaType(dll_type, dll_mfct).c_str(), dll_type,
+                            dll_version);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool Telegram::parseNWL(vector<uchar>::iterator &pos)
+{
+    return true;
+}
+
+bool Telegram::parseAFL(vector<uchar>::iterator &pos)
+{
+    // 90 0F (len) 002C (fc) 25 (mc) 49EE 0A00 77C1 9D3D 1A08 ABCD --- 729067296179161102F
+    // 90 0F (len) 002C (fc) 25 (mc) 0C39 0000 ED17 6BBB B159 1ADB --- 7A1D003007103EA
+
+    int remaining = distance(pos, frame.end());
+    if (remaining == 0) return false;
+
+    debug("(wmbus) parseAFL @%d %d\n", distance(frame.begin(), pos), remaining);
+
+    int ci_field = *pos;
+    if (!isCiFieldOfType(ci_field, CI_TYPE::AFL)) return true;
+    addExplanationAndIncrementPos(pos, 1, "%02x afl-ci-field (%s)",
+                                  ci_field, ciType(ci_field).c_str());
+    afl_ci = ci_field;
+
+    afl_len = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x afl-len (%d)",
+                                  afl_len, afl_len);
+
+    int len = ciFieldLength(afl_ci);
+    if (remaining < len) return expectedMore(__LINE__);
+
+    afl_fc_b[0] = *(pos+0);
+    afl_fc_b[1] = *(pos+1);
+    afl_fc = afl_fc_b[1] << 8 | afl_fc_b[0];
+    string afl_fc_info = toStringFromAFLFC(afl_fc);
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x afl-fc (%s)",
+                                  afl_fc_b[0], afl_fc_b[1], afl_fc_info.c_str());
+
+    bool has_key_info = afl_fc & 0x0200;
+    bool has_mac = afl_fc & 0x0400;
+    bool has_counter = afl_fc & 0x0800;
+    //bool has_len = afl_fc & 0x1000;
+    bool has_control = afl_fc & 0x2000;
+    //bool has_more_fragments = afl_fc & 0x4000;
+
+    if (has_control)
+    {
+        afl_mcl = *pos;
+        string afl_mcl_info = toStringFromAFLMC(afl_mcl);
+        addExplanationAndIncrementPos(pos, 1, "%02x afl-mcl (%s)",
+                                      afl_mcl, afl_mcl_info.c_str());
+    }
+
+    if (has_key_info)
+    {
+        afl_ki_b[0] = *(pos+0);
+        afl_ki_b[1] = *(pos+1);
+        afl_ki = afl_ki_b[1] << 8 | afl_ki_b[0];
+        string afl_ki_info = "";
+        addExplanationAndIncrementPos(pos, 2, "%02x%02x afl-ki (%s)",
+                                      afl_ki_b[0], afl_ki_b[1], afl_ki_info.c_str());
+    }
+
+    if (has_counter)
+    {
+        afl_counter_b[0] = *(pos+0);
+        afl_counter_b[1] = *(pos+1);
+        afl_counter_b[2] = *(pos+2);
+        afl_counter_b[3] = *(pos+3);
+        afl_counter = afl_counter_b[3] << 24 |
+            afl_counter_b[2] << 16 |
+            afl_counter_b[1] << 8 |
+            afl_counter_b[0];
+
+        addExplanationAndIncrementPos(pos, 4, "%02x%02x%02x%02x afl-counter (%u)",
+                                      afl_counter_b[0],afl_counter_b[1],
+                                      afl_counter_b[2],afl_counter_b[3],
+                                      afl_counter);
+    }
+
+    if (has_mac)
+    {
+        int at = afl_mcl & 0x0f;
+        AFLAuthenticationType aat = fromIntToAFLAuthenticationType(at);
+        int len = toLen(aat);
+        if (len != 2 &&
+            len != 4 &&
+            len != 8 &&
+            len != 12 &&
+            len != 16)
+        {
+            warning("(wmbus) bad length of mac\n");
+            return false;
+        }
+        for (int i=0; i<len; ++i)
+        {
+            afl_mac_b.insert(afl_mac_b.end(), *(pos+i));
+        }
+        string s = bin2hex(afl_mac_b);
+        addExplanationAndIncrementPos(pos, len, "%s afl-mac %d bytes", s.c_str(), len);
+        must_check_mac = true;
+    }
+
+    return true;
+}
+
+string Telegram::toStringFromAFLFC(int fc)
+{
+    string info = "";
+    int fid = fc & 0x00ff; // Fragmend id
+    info += to_string(fid);
+    info += " ";
+    if (fc & 0x0200) info += "KeyInfoInFragment ";
+    if (fc & 0x0400) info += "MACInFragment ";
+    if (fc & 0x0800) info += "MessCounterInFragment ";
+    if (fc & 0x1000) info += "MessLenInFragment ";
+    if (fc & 0x2000) info += "MessControlInFragment ";
+    if (fc & 0x4000) info += "MoreFragments ";
+    else             info += "LastFragment ";
+    if (info.length() > 0) info.pop_back();
+    return info;
+}
+
+string Telegram::toStringFromAFLMC(int mc)
+{
+    string info = "";
+    int at = mc & 0x0f;
+    AFLAuthenticationType aat = fromIntToAFLAuthenticationType(at);
+    info += toString(aat);
+    info += " ";
+    if (mc & 0x10) info += "KeyInfo ";
+    if (mc & 0x20) info += "MessCounter ";
+    if (mc & 0x40) info += "MessLen ";
+    if (info.length() > 0) info.pop_back();
+    return info;
+}
+
+string Telegram::toStringFromTPLConfig(int cfg)
+{
+    string info = "";
+    if (cfg & 0x8000) info += "bidirectional ";
+    if (cfg & 0x4000) info += "accessibility ";
+    if (cfg & 0x2000) info += "synchronous ";
+    if (cfg & 0x1f00)
+    {
+        int m = (cfg >> 8) & 0x1f;
+        TPLSecurityMode tsm = fromIntToTPLSecurityMode(m);
+        info += toString(tsm);
+        info += " ";
+        if (tsm == TPLSecurityMode::AES_CBC_IV)
+        {
+            int num_blocks = (cfg & 0x00f0) >> 4;
+            int cntn = (cfg & 0x000c) >> 2;
+            int ra = (cfg & 0x0002) >> 1;
+            int hc = cfg & 0x0001;
+            info += "nb="+to_string(num_blocks);
+            info += " cntn="+to_string(cntn);
+            info += " ra="+to_string(ra);
+            info += " hc="+to_string(hc);
+            info += " ";
+        }
+    }
+    if (info.length() > 0) info.pop_back();
+    return info;
+}
+
+bool Telegram::parseTPLConfig(std::vector<uchar>::iterator &pos)
+{
+    CHECK(2);
+    uchar cfg1 = *(pos+0);
+    uchar cfg2 = *(pos+1);
+    tpl_cfg = cfg2 << 8 | cfg1;
+
+    if (tpl_cfg & 0x1f00)
+    {
+        int m = (tpl_cfg >> 8) & 0x1f;
+        tpl_sec_mode = fromIntToTPLSecurityMode(m);
+    }
+    bool has_cfg_ext = false;
+    string info = toStringFromTPLConfig(tpl_cfg);
+    info += " ";
+    if (tpl_sec_mode == TPLSecurityMode::AES_CBC_IV) // Security mode 5
+    {
+        tpl_num_encr_blocks = (tpl_cfg >> 4) & 0x0f;
+    }
+    if (tpl_sec_mode == TPLSecurityMode::AES_CBC_NO_IV) // Security mode 7
+    {
+        tpl_num_encr_blocks = (tpl_cfg >> 4) & 0x0f;
+        has_cfg_ext = true;
+    }
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x tpl-cfg %04x (%s)", cfg1, cfg2, tpl_cfg, info.c_str());
+
+    if (has_cfg_ext)
+    {
+        CHECK(1);
+        tpl_cfg_ext = *(pos+0);
+        tpl_kdf_selection = (tpl_cfg_ext >> 4) & 3;
+
+        addExplanationAndIncrementPos(pos, 1, "%02x tpl-cfg-ext (KDFS=%d)", tpl_cfg_ext, tpl_kdf_selection);
+
+        if (tpl_kdf_selection == 1)
+        {
+            vector<uchar> input;
+            vector<uchar> mac;
+            mac.resize(16);
+
+            // DC C ID 0x07 0x07 0x07 0x07 0x07 0x07 0x07
+            // Derivation Constant DC = 0x00 = encryption from meter.
+            //                          0x01 = mac from meter.
+            //                          0x10 = encryption from communication partner.
+            //                          0x11 = mac from communication partner.
+            input.insert(input.end(), 0x00); // DC 00 = generate ephemereal encryption key from meter.
+            // If there is a tpl_counter, then use it, else use afl_counter.
+            input.insert(input.end(), afl_counter_b, afl_counter_b+4);
+            // If there is a tpl_id, then use it, else use ddl_id.
+            if (tpl_id_found)
+            {
+                input.insert(input.end(), tpl_id_b, tpl_id_b+4);
+            }
+            else
+            {
+                input.insert(input.end(), dll_id_b, dll_id_b+4);
+            }
+
+            // Pad.
+            for (int i=0; i<7; ++i) input.insert(input.end(), 0x07);
+
+            debugPayload("(wmbus) input to kdf for enc", input);
+
+            if (meter_keys->confidentiality_key.size() != 16)
+            {
+                if (isSimulated())
+                {
+                    debug("(wmbus) simulation without keys, not generating Kmac and Kenc.\n");
+                    return true;
+                }
+                debug("(wmbus) no key, thus cannot execute kdf.\n");
                 return false;
             }
-            string sn_info;
-            sn[0] = frame[13];
-            sn[1] = frame[14];
-            sn[2] = frame[15];
-            sn[3] = frame[16];
-            uint64_t sn_field = sn[3]<<24 | sn[2]<<16 | sn[1] << 8 | sn[0];
+            AES_CMAC(&meter_keys->confidentiality_key[0], &input[0], 16, &mac[0]);
+            string s = bin2hex(mac);
+            debug("(wmbus) ephemereal Kenc %s\n", s.c_str());
+            tpl_generated_key.clear();
+            tpl_generated_key.insert(tpl_generated_key.end(), mac.begin(), mac.end());
 
-            uchar session_field = (sn_field >> 0)  & 0x0f; // lowest 4 bits
-            uint64_t time_field = (sn_field >> 4)  & 0x1ffffff; // next 25 bits
-            uchar enc_field     = (sn_field >> 29) & 0x7; // next 3 bits.
-            if (enc_field != 0)
-            {
-                sn_info += "encrypted ";
-                is_encrypted_ = true;
-            }
-            sn_info += "session=";
-            sn_info += to_string(session_field)+" ";
-            sn_info += "time=";
-            sn_info += to_string(time_field);
-            addExplanation(bytes, 4, "%02x%02x%02x%02x sn (%s)", sn[0], sn[1], sn[2], sn[3], sn_info.c_str());
-            header_size = 6;
+            input[0] = 0x01; // DC 01 = generate ephemereal mac key from meter.
+            mac.clear();
+            mac.resize(16);
+            debugPayload("(wmbus) input to kdf for mac", input);
+            AES_CMAC(&meter_keys->confidentiality_key[0], &input[0], 16, &mac[0]);
+            s = bin2hex(mac);
+            debug("(wmbus) ephemereal Kmac %s\n", s.c_str());
+            tpl_generated_mac_key.clear();
+            tpl_generated_mac_key.insert(tpl_generated_mac_key.end(), mac.begin(), mac.end());
         }
     }
-    else if (ci_field == 0xa2)
+
+    return true;
+}
+
+bool Telegram::parseShortTPL(std::vector<uchar>::iterator &pos)
+{
+    CHECK(1);
+
+    tpl_acc = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x tpl-acc-field", tpl_acc);
+
+    CHECK(1);
+    tpl_sts = *pos;
+    addExplanationAndIncrementPos(pos, 1, "%02x tpl-sts-field", tpl_sts);
+
+    bool ok = parseTPLConfig(pos);
+    if (!ok) return false;
+
+    return true;
+}
+
+bool Telegram::parseLongTPL(std::vector<uchar>::iterator &pos)
+{
+    CHECK(4);
+    tpl_id_found = true;
+    tpl_id_b[0] = *(pos+0);
+    tpl_id_b[1] = *(pos+1);
+    tpl_id_b[2] = *(pos+2);
+    tpl_id_b[3] = *(pos+3);
+
+    addExplanationAndIncrementPos(pos, 4, "%02x%02x%02x%02x tpl-id (%02x%02x%02x%02x)", tpl_id_b[0], tpl_id_b[1], tpl_id_b[2], tpl_id_b[3],
+                                  tpl_id_b[3], tpl_id_b[2], tpl_id_b[1], tpl_id_b[0]);
+
+    CHECK(2);
+    tpl_mfct_b[0] = *(pos+0);
+    tpl_mfct_b[1] = *(pos+1);
+    tpl_mfct = tpl_mfct_b[1] << 8 | tpl_mfct_b[0];
+    string man = manufacturerFlag(tpl_mfct);
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x tpl-mfct (%s)", tpl_mfct_b[0], tpl_mfct_b[1], man.c_str());
+
+    CHECK(1);
+    tpl_version = *(pos+0);
+    addExplanationAndIncrementPos(pos, 1, "%02x tpl-version", tpl_version);
+
+    CHECK(1);
+    tpl_type = *(pos+0);
+    string info = mediaType(tpl_type, tpl_mfct);
+    addExplanationAndIncrementPos(pos, 1, "%02x tpl-type (%s)", tpl_type, info.c_str());
+
+    bool ok = parseShortTPL(pos);
+
+    return ok;
+}
+
+bool Telegram::checkMAC(std::vector<uchar> &frame,
+                        std::vector<uchar>::iterator from,
+                        std::vector<uchar>::iterator to,
+                        std::vector<uchar> &inmac,
+                        std::vector<uchar> &mackey)
+{
+    vector<uchar> input;
+    vector<uchar> mac;
+    mac.resize(16);
+
+    if (mackey.size() != 16) return false;
+    if (inmac.size() == 0) return false;
+
+    // AFL.MAC = CMAC (Kmac/Lmac,
+    //                 AFL.MCL || AFL.MCR || {AFL.ML || } NextCI || ... || Last Byte of message)
+
+    input.insert(input.end(), afl_mcl);
+    input.insert(input.end(), afl_counter_b, afl_counter_b+4);
+    input.insert(input.end(), from, to);
+    string s = bin2hex(input);
+    debug("(wmbus) input to mac %s\n", s.c_str());
+    AES_CMAC(&mackey[0], &input[0], input.size(), &mac[0]);
+    string calculated = bin2hex(mac);
+    debug("(wmbus) calculated mac %s\n", calculated.c_str());
+    string received = bin2hex(inmac);
+    debug("(wmbus) received   mac %s\n", received.c_str());
+    string truncated = calculated.substr(0, received.length());
+    bool ok = truncated == received;
+    if (ok) debug("(wmbus) mac ok!\n");
+    else {
+        debug("(wmbus) mac NOT ok!\n");
+        explainParse("BADMAC", 0);
+    }
+    return ok;
+}
+
+bool loadFormatBytesFromSignature(uint16_t format_signature, vector<uchar> *format_bytes);
+
+bool Telegram::potentiallyDecrypt(vector<uchar>::iterator &pos)
+{
+    if (tpl_sec_mode == TPLSecurityMode::AES_CBC_IV)
     {
-        // Manufacturer specific telegram payload. Oh well....
+        bool ok = decrypt_TPL_AES_CBC_IV(this, frame, pos, meter_keys->confidentiality_key);
+        if (!ok) return false;
+        // Now the frame from pos and onwards has been decrypted.
+
+        CHECK(2);
+        if (*(pos+0) != 0x2f || *(pos+1) != 0x2f)
+        {
+            if (parser_warns_)
+            {
+                if (isVerboseEnabled() || isDebugEnabled() || !warned_for_telegram_before(dll_a))
+                {
+                    // Print this warning only once! Unless you are using verbose or debug.
+                    warning("(wmbus) decrypted content failed check, did you use the correct decryption key? "
+                            "Permanently ignoring telegrams from id: %02x%02x%02x%02x mfct: (%s) %s (0x%02x) type: %s (0x%02x) ver: 0x%02x\n",
+                            dll_id_b[3], dll_id_b[2], dll_id_b[1], dll_id_b[0],
+                            manufacturerFlag(dll_mfct).c_str(),
+                            manufacturer(dll_mfct).c_str(),
+                            dll_mfct,
+                            mediaType(dll_type, dll_mfct).c_str(), dll_type,
+                            dll_version);
+                }
+            }
+            return false;
+        }
+        addExplanationAndIncrementPos(pos, 2, "%02x%02x decrypt check bytes", *(pos+0), *(pos+1));
+    }
+    else if (tpl_sec_mode == TPLSecurityMode::AES_CBC_NO_IV)
+    {
+        if (!meter_keys->hasConfidentialityKey() && isSimulated())
+        {
+            CHECK(2);
+            addExplanationAndIncrementPos(pos, 2, "%02x%02x (already) decrypted check bytes", *(pos+0), *(pos+1));
+            return true;
+        }
+        bool mac_ok = checkMAC(frame, tpl_start, frame.end(), afl_mac_b, tpl_generated_mac_key);
+
+        // Do not attempt to decrypt if the mac has failed!
+        if (!mac_ok)
+        {
+            if (parser_warns_)
+            {
+                if (isVerboseEnabled() || isDebugEnabled() || !warned_for_telegram_before(dll_a))
+                {
+                    // Print this warning only once! Unless you are using verbose or debug.
+                    warning("(wmbus) telegram mac check failed, did you use the correct decryption key? "
+                            "Permanently ignoring telegrams from id: %02x%02x%02x%02x mfct: (%s) %s (0x%02x) type: %s (0x%02x) ver: 0x%02x\n",
+                            dll_id_b[3], dll_id_b[2], dll_id_b[1], dll_id_b[0],
+                            manufacturerFlag(dll_mfct).c_str(),
+                            manufacturer(dll_mfct).c_str(),
+                            dll_mfct,
+                            mediaType(dll_type, dll_mfct).c_str(), dll_type,
+                            dll_version);
+                }
+            }
+            return false;
+        }
+
+        bool ok = decrypt_TPL_AES_CBC_NO_IV(this, frame, pos, tpl_generated_key);
+        if (!ok) return false;
+
+        // Now the frame from pos and onwards has been decrypted.
+        CHECK(2);
+        if (*(pos+0) != 0x2f || *(pos+1) != 0x2f)
+        {
+            if (parser_warns_)
+            {
+                if (isVerboseEnabled() || isDebugEnabled() || !warned_for_telegram_before(dll_a))
+                {
+                    // Print this warning only once! Unless you are using verbose or debug.
+                    warning("(wmbus) decrypted content failed check, did you use the correct decryption key? "
+                            "Permanently ignoring telegrams from id: %02x%02x%02x%02x mfct: (%s) %s (0x%02x) type: %s (0x%02x) ver: 0x%02x\n",
+                            dll_id_b[3], dll_id_b[2], dll_id_b[1], dll_id_b[0],
+                            manufacturerFlag(dll_mfct).c_str(),
+                            manufacturer(dll_mfct).c_str(),
+                            dll_mfct,
+                            mediaType(dll_type, dll_mfct).c_str(), dll_type,
+                            dll_version);
+                }
+            }
+            return false;
+        }
+        addExplanationAndIncrementPos(pos, 2, "%02x%02x decrypt check bytes", *(pos+0), *(pos+1));
+    }
+    return true;
+}
+
+bool Telegram::parse_TPL_72(vector<uchar>::iterator &pos)
+{
+    bool ok = parseLongTPL(pos);
+    if (!ok) return false;
+
+    bool decrypt_ok = potentiallyDecrypt(pos);
+
+    header_size = distance(frame.begin(), pos);
+    int remaining = distance(pos, frame.end());
+    suffix_size = 0;
+
+    if (decrypt_ok)
+    {
+        parseDV(this, frame, pos, remaining, &values);
     }
     else
     {
-        // Removed because it logs warning for every telegram, even if not 'for me'
-        //warning("Unknown ci-field %02x\n", ci_field);
+        decryption_failed = true;
     }
 
-    payload.clear();
-    int skip = 11+header_size;
-    if (skip < (int)frame.size())
+    return true;
+}
+
+bool Telegram::parse_TPL_78(vector<uchar>::iterator &pos)
+{
+    header_size = distance(frame.begin(), pos);
+    int remaining = distance(pos, frame.end());
+    suffix_size = 0;
+    parseDV(this, frame, pos, remaining, &values);
+
+    return true;
+}
+
+bool Telegram::parse_TPL_79(vector<uchar>::iterator &pos)
+{
+    // Compact frame
+    CHECK(2);
+    uchar ecrc0 = *(pos+0);
+    uchar ecrc1 = *(pos+1);
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x format signature", ecrc0, ecrc1);
+    format_signature = ecrc1<<8 | ecrc0;
+
+    vector<uchar> format_bytes;
+    bool ok = loadFormatBytesFromSignature(format_signature, &format_bytes);
+    if (!ok) {
+        // We have not yet seen a long frame, but we know the formats for some
+        // meter specific hashes.
+        ok = findFormatBytesFromKnownMeterSignatures(&format_bytes);
+        if (!ok)
+        {
+            verbose("(wmbus) ignoring compressed telegram since format signature hash 0x%02x is yet unknown.\n"
+                    "     this is not a problem, since you only need wait for at most 8 telegrams\n"
+                    "     (8*16 seconds) until an full length telegram arrives and then we know\n"
+                    "     the format giving this hash and start decoding the telegrams properly.\n",
+                    format_signature);
+            return false;
+        }
+    }
+    vector<uchar>::iterator format = format_bytes.begin();
+
+    // 2,3 = crc for payload = hash over both DRH and data bytes. Or is it only over the data bytes?
+    CHECK(2);
+    int ecrc2 = *(pos+0);
+    int ecrc3 = *(pos+1);
+    addExplanationAndIncrementPos(pos, 2, "%02x%02x data crc", ecrc2, ecrc3);
+
+    header_size = distance(frame.begin(), pos);
+    int remaining = distance(pos, frame.end());
+    suffix_size = 0;
+
+    parseDV(this, frame, pos, remaining, &values, &format, format_bytes.size());
+
+    return true;
+}
+
+bool Telegram::parse_TPL_7A(vector<uchar>::iterator &pos)
+{
+    bool ok = parseShortTPL(pos);
+    if (!ok) return false;
+
+    bool decrypt_ok = potentiallyDecrypt(pos);
+
+    header_size = distance(frame.begin(), pos);
+    int remaining = distance(pos, frame.end());
+    suffix_size = 0;
+
+    if (decrypt_ok)
     {
-        // The case 11+header_size larger than frame_size is probably due to bad input data
-        // that is currently allowed to pass, see above.
-        payload.insert(payload.end(), frame.begin()+skip, frame.end());
+        parseDV(this, frame, pos, remaining, &values);
     }
-    verbose("(wmbus) received telegram");
-    verboseFields();
-    debugPayload("(wmbus) frame", frame);
-    debugPayload("(wmbus) payload", payload);
-    if (isDebugEnabled()) {
-        explainParse("(wmbus)", 0);
+    else
+    {
+        decryption_failed = true;
     }
+    return true;
+}
+
+bool Telegram::parseTPL(vector<uchar>::iterator &pos)
+{
+    int remaining = distance(pos, frame.end());
+    if (remaining == 0) return false;
+
+    debug("(wmbus) parseTPL @%d %d\n", distance(frame.begin(), pos), remaining);
+    CHECK(1);
+    int ci_field = *pos;
+    if (!isCiFieldOfType(ci_field, CI_TYPE::TPL))
+    {
+        warning("(wmbus) Unknown tpl-ci-field %02x\n", ci_field);
+        return false;
+    }
+    tpl_ci = ci_field;
+    tpl_start = pos;
+
+    addExplanationAndIncrementPos(pos, 1, "%02x tpl-ci-field (%s)",
+                                  tpl_ci, ciType(tpl_ci).c_str());
+    int len = ciFieldLength(tpl_ci);
+
+    if (remaining < len+1) return expectedMore(__LINE__);
+
+    switch (tpl_ci)
+    {
+        case CI_Field_Values::TPL_72: return parse_TPL_72(pos);
+        case CI_Field_Values::TPL_78: return parse_TPL_78(pos);
+        case CI_Field_Values::TPL_79: return parse_TPL_79(pos);
+        case CI_Field_Values::TPL_7A: return parse_TPL_7A(pos);
+        case CI_Field_Values::MFCT_SPECIFIC_A1:
+        case CI_Field_Values::MFCT_SPECIFIC_A0: {
+            bool _ignore_header_change = false;
+
+            if(dll_type == 0x80 && dll_mfct == 0x5068) { // Techem Heat Cost Allocator
+                _ignore_header_change = true;
+            }
+
+            if(!_ignore_header_change) {
+                header_size = distance(frame.begin(), pos);
+            }
+            suffix_size = 0;
+            return true; // Manufacturer specific telegram payload. Oh well....
+        }
+        case CI_Field_Values::MFCT_SPECIFIC_A2:
+        {
+            header_size = distance(frame.begin(), pos);
+            suffix_size = 0;
+            return true; // Manufacturer specific telegram payload. Oh well....
+        }
+    }
+
+    header_size = distance(frame.begin(), pos);
+    suffix_size = 0;
+    warning("(wmbus) Not implemented tpl-ci %02x\n", tpl_ci);
+    return false;
+}
+
+bool Telegram::parseHeader(vector<uchar> &input_frame)
+{
+    bool ok;
+    explanations.clear();
+    frame = input_frame;
+    vector<uchar>::iterator pos = frame.begin();
+    // Parsed accumulates parsed bytes.
+    parsed.clear();
+
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Parse DLL Data Link Layer for Wireless MBUS. │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseDLL(pos);
+    if (!ok) return false;
+
+    return true;
+}
+
+bool Telegram::parse(vector<uchar> &input_frame, MeterKeys *mk)
+{
+    explanations.clear();
+    meter_keys = mk;
+    assert(meter_keys != NULL);
+    bool ok;
+    frame = input_frame;
+    vector<uchar>::iterator pos = frame.begin();
+    // Parsed accumulates parsed bytes.
+    parsed.clear();
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Parse DLL Data Link Layer for Wireless MBUS. │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseDLL(pos);
+    if (!ok) return false;
+
+    printDLL();
+
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Is this an ELL block?                        │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseELL(pos);
+    if (!ok) return false;
+
+    printELL();
+    if (decryption_failed) return false;
+
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Is this an NWL block?                        │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseNWL(pos);
+    if (!ok) return false;
+
+    printNWL();
+
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Is this an AFL block?                        │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseAFL(pos);
+    if (!ok) return false;
+
+    printAFL();
+
+    //     ┌──────────────────────────────────────────────┐
+    //     │                                              │
+    //     │ Is this a TPL block? It ought to be!         │
+    //     │                                              │
+    //     └──────────────────────────────────────────────┘
+
+    ok = parseTPL(pos);
+    if (!ok) return false;
+
+    printTPL();
+    if (decryption_failed) return false;
+
     return true;
 }
 
 void Telegram::explainParse(string intro, int from)
 {
     for (auto& p : explanations) {
-        if (p.first < from) continue;
         debug("%s %02x: %s\n", intro.c_str(), p.first, p.second.c_str());
     }
-    string hex = bin2hex(parsed);
-    debug("%s %s\n", intro.c_str(), hex.c_str());
 }
 
-void Telegram::expectVersion(const char *info, int v)
+string Telegram::autoDetectPossibleDrivers()
 {
-    if (v != 0 && a_field_version != v) {
-        warning("(%s) expected telegram with version 0x%02x, but got version 0x%02x !\n", info, v, a_field_version);
-    }
+    vector<string> drivers;
+    detectMeterDriver(dll_mfct, dll_type, dll_version, &drivers);
+    string possibles;
+    for (string d : drivers) possibles = possibles+d+" ";
+    if (possibles != "") possibles.pop_back();
+    else possibles = "unknown!";
+
+    return possibles;
 }
 
 string cType(int c_field)
 {
-    switch (c_field) {
-    case 0x44: return "SND_NR";
-    case 0x46: return "SND_IR";
-    case 0x48: return "RSP_UD";
+    string s;
+    if (c_field & 0x80)
+    {
+        s += "relayed ";
     }
-    return "?";
+
+    if (c_field & 0x40)
+    {
+        s += "from meter ";
+    }
+    else
+    {
+        s += "to meter ";
+    }
+
+    int code = c_field & 0x0f;
+
+    switch (code) {
+    case 0x0: s += "SND_NKE"; break; // to meter, link reset
+    case 0x3: s += "SND_UD2"; break; // to meter, command = user data
+    case 0x4: s += "SND_NR"; break; // from meter, unsolicited data, no response expected
+    case 0x5: s += "SND_UD3"; break; // to multiple meters, command = user data, no response expected
+    case 0x6: s += "SND_IR"; break; // from meter, installation request/data
+    case 0x7: s += "ACC_NR"; break; // from meter, unsolicited offers to access the meter
+    case 0x8: s += "ACC_DMD"; break; // from meter, unsolicited demand to access the meter
+    case 0xa: s += "REQ_UD1"; break; // to meter, alarm request
+    case 0xb: s += "REQ_UD2"; break; // to meter, data request
+    }
+
+    return s;
 }
 
 string ccType(int cc_field)
@@ -2444,4 +3222,1247 @@ string measurementTypeName(MeasurementType mt)
 }
 
 WMBus::~WMBus() {
+}
+
+bool Telegram::findFormatBytesFromKnownMeterSignatures(vector<uchar> *format_bytes)
+{
+    bool ok = true;
+    if (format_signature == 0xa8ed)
+    {
+        hex2bin("02FF2004134413615B6167", format_bytes);
+        debug("(wmbus) using hard coded format for hash a8ed\n");
+    }
+    else if (format_signature == 0xc412)
+    {
+        hex2bin("02FF20041392013BA1015B8101E7FF0F", format_bytes);
+        debug("(wmbus) using hard coded format for hash c412\n");
+    }
+    else if (format_signature == 0x61eb)
+    {
+        hex2bin("02FF2004134413A1015B8101E7FF0F", format_bytes);
+        debug("(wmbus) using hard coded format for hash 61eb\n");
+    }
+    else if (format_signature == 0xd2f7)
+    {
+        hex2bin("02FF2004134413615B5167", format_bytes);
+        debug("(wmbus) using hard coded format for hash d2f7\n");
+    }
+    else if (format_signature == 0xdd34)
+    {
+        hex2bin("02FF2004134413", format_bytes);
+        debug("(wmbus) using hard coded format for hash dd34\n");
+    }
+    else
+    {
+        ok = false;
+    }
+    return ok;
+}
+
+WMBusCommonImplementation::~WMBusCommonImplementation()
+{
+    manager_->listenTo(this->serial(), NULL);
+    manager_->onDisappear(this->serial(), NULL);
+    debug("(wmbus) deleted %s\n", toString(type()));
+}
+
+WMBusCommonImplementation::WMBusCommonImplementation(WMBusDeviceType t,
+                                                     shared_ptr<SerialCommunicationManager> manager,
+                                                     shared_ptr<SerialDevice> serial,
+                                                     bool is_serial)
+    : manager_(manager),
+      is_serial_(is_serial),
+      is_working_(true),
+      type_(t),
+      serial_(serial),
+      cached_device_id_(""),
+      cached_device_unique_id_(""),
+      command_mutex_("wmbus_command_mutex"),
+      waiting_for_response_sem_("waiting_for_response_sem")
+{
+    // Initialize timeout from now.
+    last_received_ = time(NULL);
+    last_reset_ = time(NULL);
+    manager_->listenTo(this->serial(),call(this,processSerialData));
+    manager_->onDisappear(this->serial(),call(this,disconnectedFromDevice));
+}
+
+string WMBusCommonImplementation::hr()
+{
+    if (cached_hr_ == "")
+    {
+        cached_hr_ = device()+":"+toString(type())+"["+getDeviceId()+"]";
+    }
+
+    return cached_hr_;
+}
+
+bool WMBusCommonImplementation::isSerial()
+{
+    return is_serial_;
+}
+
+void WMBusCommonImplementation::markAsNoLongerSerial()
+{
+    // When you override the serial device with a file for an im871a, then
+    // it is no longer a serial device.
+    is_serial_ = false;
+}
+
+WMBusDeviceType WMBusCommonImplementation::type()
+{
+    return type_;
+}
+
+void WMBusCommonImplementation::onTelegram(function<bool(AboutTelegram&,vector<uchar>)> cb)
+{
+    telegram_listeners_.push_back(cb);
+}
+
+
+static bool ignore_duplicate_telegrams_ = false;
+
+void setIgnoreDuplicateTelegrams(bool idt)
+{
+    ignore_duplicate_telegrams_ = idt;
+}
+
+bool WMBusCommonImplementation::handleTelegram(AboutTelegram &about, vector<uchar> frame)
+{
+    bool handled = false;
+    last_received_ = time(NULL);
+
+    if (ignore_duplicate_telegrams_ && seen_this_telegram_before(frame))
+    {
+        verbose("(wmbus) skipping already handled telegram.\n");
+        return true;
+    }
+
+    for (auto f : telegram_listeners_)
+    {
+        if (f)
+        {
+            bool h = f(about, frame);
+            if (h) handled = true;
+        }
+    }
+
+    return handled;
+}
+
+void WMBusCommonImplementation::protocolErrorDetected()
+{
+    protocol_error_count_++;
+}
+
+void WMBusCommonImplementation::resetProtocolErrorCount()
+{
+    protocol_error_count_ = 0;
+}
+
+void WMBusCommonImplementation::setLinkModes(LinkModeSet lms)
+{
+    link_modes_ = lms;
+    deviceSetLinkModes(lms);
+    link_modes_configured_ = true;
+}
+
+bool WMBusCommonImplementation::areLinkModesConfigured()
+{
+    return link_modes_configured_;
+}
+
+LinkModeSet WMBusCommonImplementation::protectedGetLinkModes()
+{
+    return link_modes_;
+}
+
+void WMBusCommonImplementation::deviceClose()
+{
+}
+
+void WMBusCommonImplementation::close()
+{
+    debug("(wmbus) closing....\n");
+    if (serial())
+    {
+        if (serial()->opened() && serial()->working())
+        {
+            debug("(wmbus) yes closing....\n");
+            serial()->close();
+            manager_->removeNonWorking(serial()->device());
+            serial_ = NULL;
+        }
+    }
+
+    // Invoke any other device specific close for this device.
+    deviceClose();
+}
+
+bool WMBusCommonImplementation::reset()
+{
+    last_reset_ = time(NULL);
+    bool resetting = false;
+    if (serial())
+    {
+        if (serial()->opened() && serial()->working())
+        {
+            // This is a reset, not an init. Close the serial device.
+            resetting = true;
+            serial()->resetInitiated();
+            serial()->close();
+            // Give the device 3 seconds to shut down properly.
+            usleep(3000*1000);
+        }
+
+        AccessCheck rc = serial()->open(false);
+
+        if (rc != AccessCheck::AccessOK)
+        {
+            // Ouch....
+            return false;
+        }
+    }
+
+    // Invoke any other device specific resets for this device.
+    deviceReset();
+
+    if (resetting) serial()->resetCompleted();
+
+    // If init, then no link modes are configured.
+    // If reset, re-initialize the link modes.
+    if (areLinkModesConfigured())
+    {
+        deviceSetLinkModes(protectedGetLinkModes());
+    }
+
+    return true;
+}
+
+void WMBusCommonImplementation::disconnectedFromDevice()
+{
+    if (is_working_)
+    {
+        debug("(wmbus) disconnected %s %s\n", device().c_str(), toString(type()));
+        is_working_ = false;
+    }
+}
+
+bool WMBusCommonImplementation::isWorking()
+{
+    return is_working_;
+}
+
+void WMBusCommonImplementation::checkStatus()
+{
+    trace("[ALARM] check status\n");
+
+    time_t since_last_reset = time(NULL) - last_reset_;
+    if (reset_timeout_ > 1 &&
+        since_last_reset > reset_timeout_ &&
+        !serial()->checkIfDataIsPending() &&
+        !serial()->readonly())
+    {
+        verbose("(wmbus) regular reset of %s %s\n", device().c_str(), toString(type()));
+        bool ok = reset();
+        if (ok) return;
+        string msg;
+        strprintf(msg, "failed regular reset of %s %s", device().c_str(), toString(type()));
+        logAlarm(Alarm::RegularResetFailure, msg);
+        return;
+    }
+
+    if (protocol_error_count_ >= 20)
+    {
+        string msg;
+        strprintf(msg, "too many protocol errors(%d) resetting %s %s", protocol_error_count_, device().c_str(), toString(type()));
+        logAlarm(Alarm::DeviceFailure, msg);
+        bool ok = reset();
+        if (ok)
+        {
+            warning("(wmbus) successfully reset wmbus device\n");
+            resetProtocolErrorCount();
+            return;
+        }
+
+        strprintf(msg, "failed to reset wmbus device %s %s exiting wmbusmeters", device().c_str(), toString(type()));
+        logAlarm(Alarm::DeviceFailure, msg);
+        manager_->stop();
+        return;
+    }
+
+    time_t now = time(NULL);
+    time_t then = now - timeout_;
+    time_t since = now-last_received_;
+
+    // If no timeout set, just return.
+    if (timeout_ == 0) return;
+
+    if (since < timeout_)
+    {
+        trace("[WMBUS] No timeout since=%d timeout=%d. All ok.\n", since, timeout_);
+        return;
+    }
+
+    last_received_ = time(NULL);
+    debug("(wmbus) updated_last received for %s (%s)\n", toString(type()), device().c_str());
+
+    // The timeout has expired! But is the timeout expected because there should be no activity now?
+    // Also, do not sound the alarm unless we actually have a possible timeout within the expected activity,
+    // otherwise we will always get an alarm when we enter the expected activity period.
+    if (!(isInsideTimePeriod(now, expected_activity_) &&
+          isInsideTimePeriod(then, expected_activity_)))
+    {
+        trace("[WMBUS] hit timeout(%d s) but this is ok, since there is no expected activity.\n", timeout_);
+        return;
+    }
+
+    // Ok, timeout has triggered for real! Deal with it!
+    struct tm nowtm;
+    localtime_r(&now, &nowtm);
+
+    string nowtxt = strdatetime(&nowtm);
+
+    string msg;
+    strprintf(msg, "%d seconds of inactivity resetting %s %s "
+              "(timeout %ds expected %s now %s)",
+              since, device().c_str(), toString(type()),
+              timeout_, expected_activity_.c_str(), nowtxt.c_str());
+
+    logAlarm(Alarm::DeviceInactivity, msg);
+
+    bool ok = reset();
+    if (ok)
+    {
+        warning("(wmbus) successfully reset wmbus device\n");
+    }
+    else
+    {
+        strprintf(msg, "failed to reset wmbus device %s %s exiting wmbusmeters", device().c_str(), toString(type()));
+        logAlarm(Alarm::DeviceFailure, msg);
+        manager_->stop();
+    }
+}
+
+void WMBusCommonImplementation::setResetInterval(int seconds)
+{
+    reset_timeout_ = seconds;
+}
+
+void WMBusCommonImplementation::setTimeout(int seconds, string expected_activity)
+{
+    assert(seconds >= 0);
+
+    timeout_ = seconds;
+    if (expected_activity == "")
+    {
+        expected_activity = "mon-sun(00-23)";
+    }
+    expected_activity_ = expected_activity;
+    if (seconds > 0)
+    {
+        debug("(wmbus) set timeout %s to \"%d\" with expected activity \"%s\"\n", toString(type_), timeout_, expected_activity_.c_str());
+    }
+    else
+    {
+        debug("(wmbus) no alarm (expected activity) for %s\n", toString(type_));
+    }
+}
+
+bool WMBusCommonImplementation::waitForResponse(int id)
+{
+    assert(waiting_for_response_id_ == 0 && id != 0);
+
+    waiting_for_response_id_ = id;
+
+    return waiting_for_response_sem_.wait();
+}
+
+bool WMBusCommonImplementation::notifyResponseIsHere(int id)
+{
+    if (id != waiting_for_response_id_) return false;
+
+    waiting_for_response_id_ = 0;
+    waiting_for_response_sem_.notify();
+
+    return true;
+}
+
+int toInt(TPLSecurityMode tsm)
+{
+    switch (tsm) {
+
+#define X(name,nr) case TPLSecurityMode::name : return nr;
+LIST_OF_TPL_SECURITY_MODES
+#undef X
+    }
+
+    return 16;
+}
+
+const char *toString(TPLSecurityMode tsm)
+{
+    switch (tsm) {
+
+#define X(name,nr) case TPLSecurityMode::name : return #name;
+LIST_OF_TPL_SECURITY_MODES
+#undef X
+    }
+
+    return "Reserved";
+}
+
+TPLSecurityMode fromIntToTPLSecurityMode(int i)
+{
+    switch (i) {
+
+#define X(name,nr) case nr: return TPLSecurityMode::name;
+LIST_OF_TPL_SECURITY_MODES
+#undef X
+    }
+
+    return TPLSecurityMode::SPECIFIC_16_31;
+}
+
+int toInt(ELLSecurityMode esm)
+{
+    switch (esm) {
+
+#define X(name,nr) case ELLSecurityMode::name : return nr;
+LIST_OF_ELL_SECURITY_MODES
+#undef X
+    }
+
+    return 2;
+}
+
+const char *toString(ELLSecurityMode esm)
+{
+    switch (esm) {
+
+#define X(name,nr) case ELLSecurityMode::name : return #name;
+LIST_OF_ELL_SECURITY_MODES
+#undef X
+    }
+
+    return "?";
+}
+
+ELLSecurityMode fromIntToELLSecurityMode(int i)
+{
+    switch (i) {
+
+#define X(name,nr) case nr: return ELLSecurityMode::name;
+LIST_OF_ELL_SECURITY_MODES
+#undef X
+    }
+
+    return ELLSecurityMode::RESERVED;
+}
+
+void Telegram::extractMfctData(vector<uchar> *pl)
+{
+    pl->clear();
+    if (mfct_0f_index == -1) return;
+
+    vector<uchar>::iterator from = frame.begin()+header_size+mfct_0f_index;
+    vector<uchar>::iterator to = frame.end()-suffix_size;
+    pl->insert(pl->end(), from, to);
+}
+
+void Telegram::extractPayload(vector<uchar> *pl)
+{
+    pl->clear();
+    vector<uchar>::iterator from = frame.begin()+header_size;
+    vector<uchar>::iterator to = frame.end()-suffix_size;
+    pl->insert(pl->end(), from, to);
+}
+
+void Telegram::extractFrame(vector<uchar> *fr)
+{
+    *fr = frame;
+}
+
+int toInt(AFLAuthenticationType aat)
+{
+    switch (aat) {
+
+#define X(name,nr,len) case AFLAuthenticationType::name : return nr;
+LIST_OF_AFL_AUTH_TYPES
+#undef X
+    }
+
+    return 16;
+}
+
+int toLen(AFLAuthenticationType aat)
+{
+    switch (aat) {
+
+#define X(name,nr,len) case AFLAuthenticationType::name : return len;
+LIST_OF_AFL_AUTH_TYPES
+#undef X
+    }
+
+    return 0;
+}
+
+const char *toString(AFLAuthenticationType tsm)
+{
+    switch (tsm) {
+
+#define X(name,nr,len) case AFLAuthenticationType::name : return #name;
+LIST_OF_AFL_AUTH_TYPES
+#undef X
+    }
+
+    return "Reserved";
+}
+
+AFLAuthenticationType fromIntToAFLAuthenticationType(int i)
+{
+    switch (i) {
+#define X(name,nr,len) case nr: return AFLAuthenticationType::name;
+LIST_OF_AFL_AUTH_TYPES
+#undef X
+    }
+
+    return AFLAuthenticationType::Reserved1;
+}
+
+AccessCheck findAndDetect(shared_ptr<SerialCommunicationManager> manager,
+                          string *out_device,
+                          function<AccessCheck(string,shared_ptr<SerialCommunicationManager>)> check,
+                          string dongle_name,
+                          string device_root)
+{
+    string dev = device_root;
+    debug("(%s) exists? %s\n", dongle_name.c_str(), dev.c_str());
+    AccessCheck ac = checkIfExistsAndSameGroup(dev);
+    *out_device = dev;
+    if (ac == AccessCheck::AccessOK)
+    {
+        debug("(%s) checking %s\n", dongle_name.c_str(), dev.c_str());
+        AccessCheck rc = check(dev, manager);
+        if (rc == AccessCheck::AccessOK) return AccessCheck::AccessOK;
+    }
+
+    if (ac == AccessCheck::NotSameGroup)
+    {
+        // Device exists, but you do not belong to its group!
+        // This will short circuit testing for other devices.
+        // But not being in the same group is such a problematic
+        // situation, that we can stop early.
+        return AccessCheck::NotSameGroup;
+    }
+
+    *out_device = "";
+    // No device found!
+    return AccessCheck::NotThere;
+}
+
+AccessCheck checkAccessAndDetect(shared_ptr<SerialCommunicationManager> manager,
+                                 function<AccessCheck(string,shared_ptr<SerialCommunicationManager>)> check,
+                                 string dongle_name,
+                                 string device)
+{
+    debug("(%s) exists? %s\n", dongle_name.c_str(), device.c_str());
+    AccessCheck ac = checkIfExistsAndSameGroup(device);
+    if (ac == AccessCheck::AccessOK)
+    {
+        debug("(%s) checking %s\n", dongle_name.c_str(), device.c_str());
+        AccessCheck rc = check(device, manager);
+        if (rc == AccessCheck::AccessOK) return AccessCheck::AccessOK;
+        return AccessCheck::NotThere;
+    }
+    if (ac == AccessCheck::NotSameGroup)
+    {
+        // Device exists, but you do not belong to its group!
+        return AccessCheck::NotSameGroup;
+    }
+
+    // No device found!
+    return AccessCheck::NotThere;
+}
+
+bool trimCRCsFrameFormatA(std::vector<uchar> &payload)
+{
+    if (payload.size() < 12) {
+        debug("(wmbus) not enough bytes! expected at least 12 but got (%zu)!\n", payload.size());
+        return false;
+    }
+    size_t len = payload.size();
+    debugPayload("(wmbus) trimming frame A", payload);
+
+    vector<uchar> out;
+
+    uint16_t calc_crc = crc16_EN13757(&payload[0], 10);
+    uint16_t check_crc = payload[10] << 8 | payload[11];
+
+    if (calc_crc != check_crc)
+    {
+        debug("(wmbus) ff a dll crc first (calculated %04x) did not match (expected %04x) for bytes 0-%zu!\n", calc_crc, check_crc, 10);
+        return false;
+    }
+    out.insert(out.end(), payload.begin(), payload.begin()+10);
+    debug("(wmbus) ff a dll crc 0-%zu %04x ok\n", 10-1, calc_crc);
+
+    size_t pos = 12;
+    for (pos = 12; pos+18 <= len; pos += 18)
+    {
+        size_t to = pos+16;
+        calc_crc = crc16_EN13757(&payload[pos], 16);
+        check_crc = payload[to] << 8 | payload[to+1];
+        if (calc_crc != check_crc)
+        {
+            debug("(wmbus) ff a dll crc mid (calculated %04x) did not match (expected %04x) for bytes %zu-%zu!\n",
+                  calc_crc, check_crc, pos, to-1);
+            return false;
+        }
+        out.insert(out.end(), payload.begin()+pos, payload.begin()+pos+16);
+        debug("(wmbus) ff a dll crc mid %zu-%zu %04x ok\n", pos, to-1, calc_crc);
+    }
+
+    if (pos < len-2)
+    {
+        size_t tto = len-2;
+        size_t blen = (tto-pos);
+        calc_crc = crc16_EN13757(&payload[pos], blen);
+        check_crc = payload[tto] << 8 | payload[tto+1];
+        if (calc_crc != check_crc)
+        {
+            debug("(wmbus) ff a dll crc final (calculated %04x) did not match (expected %04x) for bytes %zu-%zu!\n",
+                  calc_crc, check_crc, pos, tto-1);
+            return false;
+        }
+        out.insert(out.end(), payload.begin()+pos, payload.begin()+tto);
+        debug("(wmbus) ff a dll crc final %zu-%zu %04x ok\n", pos, tto-1, calc_crc);
+    }
+
+    out[0] = out.size()-1;
+    size_t new_len = out[0]+1;
+    size_t old_size = payload.size();
+    payload = out;
+    size_t new_size = payload.size();
+
+    debug("(wmbus) trimmed %zu crc bytes from frame a and ignored %zu suffix bytes.\n", (len-new_len), (old_size-new_size)-(len-new_len));
+    debugPayload("(wmbus) trimmed  frame A", payload);
+
+    return true;
+}
+
+bool trimCRCsFrameFormatB(std::vector<uchar> &payload)
+{
+    if (payload.size() < 12) {
+        debug("(wmbus) not enough bytes! expected at least 12 but got (%zu)!\n", payload.size());
+        return false;
+    }
+    size_t len = payload.size();
+    debugPayload("(wmbus) trimming frame B", payload);
+
+    vector<uchar> out;
+    size_t crc1_pos, crc2_pos;
+    if (len <= 128)
+    {
+        crc1_pos = len-2;
+        crc2_pos = 0;
+    }
+    else
+    {
+        crc1_pos = 126;
+        crc2_pos = len-2;
+    }
+
+    uint16_t calc_crc = crc16_EN13757(&payload[0], crc1_pos);
+    uint16_t check_crc = payload[crc1_pos] << 8 | payload[crc1_pos+1];
+
+    if (calc_crc != check_crc)
+    {
+        debug("(wmbus) ff b dll crc (calculated %04x) did not match (expected %04x) for bytes 0-%zu!\n", calc_crc, check_crc, crc1_pos);
+        return false;
+    }
+
+    out.insert(out.end(), payload.begin(), payload.begin()+crc1_pos);
+    debug("(wmbus) ff b dll crc first 0-%zu %04x ok\n", crc1_pos, calc_crc);
+
+    if (crc2_pos > 0)
+    {
+        calc_crc = crc16_EN13757(&payload[crc1_pos+2], crc2_pos);
+        check_crc = payload[crc2_pos] << 8 | payload[crc2_pos+1];
+
+        if (calc_crc != check_crc)
+        {
+            debug("(wmbus) ff b dll crc (calculated %04x) did not match (expected %04x) for bytes %zu-%zu!\n",
+                  calc_crc, check_crc, crc1_pos+2, crc2_pos);
+            return false;
+        }
+
+        out.insert(out.end(), payload.begin()+crc1_pos+2, payload.begin()+crc2_pos);
+        debug("(wmbus) ff b dll crc final %zu-%zu %04x ok\n", crc1_pos+2, crc2_pos, calc_crc);
+    }
+
+    out[0] = out.size()-1;
+    size_t new_len = out[0]+1;
+    size_t old_size = payload.size();
+    payload = out;
+    size_t new_size = payload.size();
+
+    debug("(wmbus) trimmed %zu crc bytes from frame b and ignored %zu suffix bytes.\n", (len-new_len), (old_size-new_size)-(len-new_len));
+    debugPayload("(wmbus) trimmed  frame B", payload);
+
+    return true;
+}
+
+FrameStatus checkWMBusFrame(vector<uchar> &data,
+                            size_t *frame_length,
+                            int *payload_len_out,
+                            int *payload_offset)
+{
+    // Nice clean: 2A442D2C998734761B168D2021D0871921|58387802FF2071000413F81800004413F8180000615B
+    // Ugly: 00615B2A442D2C998734761B168D2021D0871921|58387802FF2071000413F81800004413F8180000615B
+    // Here the frame is prefixed with some random data.
+
+    debugPayload("(wmbus) checkWMBUSFrame\n", data);
+
+    if (data.size() < 11)
+    {
+        debug("(wmbus) less than 11 bytes, partial frame\n");
+        return PartialFrame;
+    }
+    int payload_len = data[0];
+    int type = data[1];
+    int offset = 1;
+
+    if (type != 0x44)
+    {
+        // Ouch, we are out of sync with the wmbus frames that we expect!
+        // Since we currently do not handle any other type of frame, we can
+        // look for the byte 0x44 in the buffer. If we find a 0x44 byte and
+        // the length byte before it maps to the end of the buffer,
+        // then we have found a valid telegram.
+        bool found = false;
+        for (size_t i = 0; i < data.size()-2; ++i)
+        {
+            if (data[i+1] == 0x44)
+            {
+                payload_len = data[i];
+                size_t remaining = data.size()-i;
+                if (data[i]+1 == (uchar)remaining && data[i+1] == 0x44)
+                {
+                    found = true;
+                    offset = i+1;
+                    verbose("(wmbus) out of sync, skipping %d bytes.\n", (int)i);
+                    break;
+                }
+            }
+        }
+        if (!found)
+        {
+            // No sensible telegram in the buffer. Flush it!
+            verbose("(wmbus) no sensible telegram found, clearing buffer.\n");
+            data.clear();
+            return ErrorInFrame;
+        }
+    }
+    *payload_len_out = payload_len;
+    *payload_offset = offset;
+    *frame_length = payload_len+offset;
+    if (data.size() < *frame_length)
+    {
+        debug("(wmbus) not enough bytes, partial frame %d %d\n", data.size(), *frame_length);
+        return PartialFrame;
+    }
+
+    debug("(wmbus) received full frame.\n");
+    return FullFrame;
+}
+
+string decodeTPLStatusByte(uchar sts, map<int,string> vendor_lookup)
+{
+    string s;
+
+    if (sts == 0) return "OK";
+    if ((sts & 0x03) == 0x01) s += "BUSY ";
+    if ((sts & 0x03) == 0x02) s += "ERROR ";
+    if ((sts & 0x03) == 0x03) s += "ALARM ";
+
+    if ((sts & 0x04) == 0x04) s += "POWER_LOW ";
+    if ((sts & 0x08) == 0x08) s += "PERMANENT_ERROR ";
+    if ((sts & 0x10) == 0x10) s += "TEMPORARY_ERROR ";
+
+    if ((sts & 0xe0) != 0)
+    {
+        // Vendor specific bits are set, lets translate them.
+        int v = sts & 0xf8; // Zero the 3 lowest bits.
+        if (vendor_lookup.count(v) != 0)
+        {
+            s += vendor_lookup[v];
+            s += " ";
+        }
+        else
+        {
+            // We could not translate, just print the bits.
+            string tmp;
+            strprintf(tmp, "%02x ", sts);
+            s += tmp;
+        }
+    }
+
+    s.pop_back();
+    return s;
+}
+
+const char *toString(WMBusDeviceType t)
+{
+    switch (t)
+    {
+#define X(name,text,tty,rtlsdr) case DEVICE_ ## name: return #text;
+LIST_OF_MBUS_DEVICES
+#undef X
+
+    }
+    return "?";
+}
+
+const char *toLowerCaseString(WMBusDeviceType t)
+{
+    switch (t)
+    {
+#define X(name,text,tty,rtlsdr) case DEVICE_ ## name: return #text;
+LIST_OF_MBUS_DEVICES
+#undef X
+
+    }
+    return "?";
+}
+
+WMBusDeviceType toWMBusDeviceType(string &t)
+{
+#define X(name,text,tty,rtlsdr) if (t == #text) return DEVICE_ ## name;
+LIST_OF_MBUS_DEVICES
+#undef X
+    return DEVICE_UNKNOWN;
+}
+
+bool is_command(string b, string *cmd)
+{
+    // Check if CMD(.)
+    if (b.length() < 6) return false;
+    if (b.rfind("CMD(", 0) != 0) return false;
+    if (b.back() != ')') return false;
+    *cmd = b.substr(4, b.length()-5);
+    return true;
+}
+
+bool is_bps(string b)
+{
+    if (b == "300") return true;
+    if (b == "600") return true;
+    if (b == "1200") return true;
+    if (b == "2400") return true;
+    if (b == "4800") return true;
+    if (b == "9600") return true;
+    if (b == "14400") return true;
+    if (b == "19200") return true;
+    if (b == "38400") return true;
+    if (b == "57600") return true;
+    if (b == "115200") return true;
+    return false;
+}
+
+bool check_file(string f, bool *is_tty, bool *is_stdin, bool *is_file, bool *is_simulation)
+{
+    *is_tty = *is_stdin = *is_file = *is_simulation = false;
+    if (f == "stdin")
+    {
+        *is_stdin = true;
+        return true;
+    }
+    if (f == "rtlwmbus" || f == "rlt433")
+    {
+        // Prevent wmbusmeters from finding a file named rtlwmbus or rtl433 since this is probably a usage error.
+        // Most likely the user accidentally created such a file. Without this test the existence of such
+        // a file will confuse the user to no end....
+        return false;
+    }
+    if (checkIfSimulationFile(f.c_str()))
+    {
+        *is_simulation = true;
+        return true;
+    }
+    if (checkCharacterDeviceExists(f.c_str(), false))
+    {
+        *is_tty = true;
+        return true;
+    }
+    if (checkFileExists(f.c_str()))
+    {
+        *is_file = true;
+        return true;
+    }
+    if (f.find("/dev") != string::npos)
+    {
+        // Meter names are forbidden to have slashes in their names.
+        // This is probably a path to /dev/ttyUSB0 that does not exist right now.
+        *is_tty = true;
+        return true;
+    }
+    return false;
+}
+
+bool is_type_id(string t, WMBusDeviceType *out_type, string *out_id)
+{
+    // im871a im871a[12345678]
+    // auto
+    // rtlwmbus rtlwmbus[plast123]
+    if (t == "auto")
+    {
+        *out_type = WMBusDeviceType::DEVICE_AUTO;
+        *out_id = "";
+        return true;
+    }
+
+    size_t pps = t.find('[');
+    size_t ppe = t.find(']');
+
+    if (pps == string::npos && ppe == string::npos)
+    {
+        // No brackets found, is t a known wmbus device? like im871a amb8465 etc....
+        WMBusDeviceType tt = toWMBusDeviceType(t);
+        if (tt == DEVICE_UNKNOWN) return false;
+        *out_type = toWMBusDeviceType(t);
+        *out_id = "";
+        return true;
+    }
+
+    if (pps != string::npos && ppe != string::npos &&
+        pps > 0  && pps < ppe && ppe == t.length()-1)
+    {
+        string type = t.substr(0, pps);
+        string id = t.substr(pps+1, ppe-pps-1);
+        WMBusDeviceType tt = toWMBusDeviceType(type);
+        if (tt == DEVICE_UNKNOWN) return false;
+        *out_type = toWMBusDeviceType(type);
+        *out_id = id;
+        return true;
+    }
+
+    // Some oddball combination of parentheses were found, give up.
+    return false;
+}
+
+void SpecifiedDevice::clear()
+{
+    file = "";
+    type = WMBusDeviceType::DEVICE_UNKNOWN;
+    id = "";
+    fq = "";
+    linkmodes.clear();
+}
+
+string SpecifiedDevice::str()
+{
+    string r;
+    if (file != "") r += file+":";
+    if (type != WMBusDeviceType::DEVICE_UNKNOWN)
+    {
+        r += toString(type);
+        if (id != "")
+        {
+            r += "["+id+"]";
+        }
+        r += ":";
+    }
+    if (bps != "") r += bps+":";
+    if (fq != "") r += fq+":";
+    if (!linkmodes.empty()) r += linkmodes.hr()+":";
+    if (command != "") r += "CMD("+command+"):";
+
+    if (r.size() > 0) r.pop_back();
+
+    if (r == "") return "auto";
+
+    return r;
+}
+
+bool SpecifiedDevice::isLikelyDevice(string &arg)
+{
+    // Only devices are allowed to contain colons.
+    // Devices usually contain a colon!
+    if (arg.find(":") != string::npos) return true;
+    return false;
+}
+
+bool SpecifiedDevice::parse(string &arg)
+{
+    clear();
+
+    bool file_checked = false;
+    bool typeid_checked = false;
+    bool bps_checked = false;
+    bool fq_checked = false;
+    bool linkmodes_checked = false;
+    bool command_checked = false;
+
+    // For the moment the colon : is forbidden in file names and commands.
+    // It cannot occur in type,fq or bps.
+    vector<string> parts = splitString(arg, ':');
+
+    // Most maxed out device spec, though not valid, since file+cmd is not allowed.
+    // Example /dev/ttyUSB0:im871a[12345678]:9600:868.95M:c1,t1:CMD(rtl_433 -F csv -f 123M)
+
+    //         file         type   id        bps  fq     linkmodes command
+    for (auto& p : parts)
+    {
+        if (file_checked && typeid_checked && file == "" && type == WMBusDeviceType::DEVICE_UNKNOWN && id == "")
+        {
+            // There must be either a file and/or type(id). If none are found,
+            // then the specified device string is faulty.
+            return false;
+        }
+        if (!file_checked && check_file(p, &is_tty, &is_stdin, &is_file, &is_simulation))
+        {
+            file_checked = true;
+            file = p;
+        }
+        else if (!typeid_checked && is_type_id(p, &type, &id))
+        {
+            file_checked = true;
+            typeid_checked = true;
+        }
+        else if (!bps_checked && is_bps(p))
+        {
+            file_checked = true;
+            typeid_checked = true;
+            bps_checked = true;
+            bps = p;
+        }
+        else if (!fq_checked && isFrequency(p))
+        {
+            file_checked = true;
+            typeid_checked = true;
+            bps_checked = true;
+            fq_checked = true;
+            fq = p;
+        }
+        else if (!linkmodes_checked && isValidLinkModes(p))
+        {
+            file_checked = true;
+            typeid_checked = true;
+            bps_checked = true;
+            fq_checked = true;
+            linkmodes_checked = true;
+            linkmodes = parseLinkModes(p);
+        }
+        else if (!command_checked && is_command(p, &command))
+        {
+            file_checked = true;
+            typeid_checked = true;
+            bps_checked = true;
+            fq_checked = true;
+            linkmodes_checked = true;
+            command_checked = true;
+        }
+        else
+        {
+            // Unknown part....
+            return false;
+        }
+    }
+
+    // Auto is only allowed to be combined with linkmodes and/or frequencies!
+    if (type == WMBusDeviceType::DEVICE_AUTO && (file != "" || bps != "")) return false;
+    // You cannot combine a file with a command.
+    if (file != "" && command != "") return false;
+    return true;
+}
+
+Detected detectWMBusDeviceOnTTY(string tty,
+                                LinkModeSet desired_linkmodes,
+                                shared_ptr<SerialCommunicationManager> handler)
+{
+    Detected detected;
+    // Fake a specified device.
+    detected.found_file = tty;
+    detected.specified_device.is_tty = true;
+    detected.specified_device.linkmodes = desired_linkmodes;
+
+    // If im87a is tested first, a delay of 1s must be inserted
+    // before amb8465 is tested, lest it will not respond properly.
+    // It really should not matter, but perhaps is the uart of the amber
+    // confused by the 57600 speed....or maybe there is some other reason.
+    // Anyway by testing for the amb8465 first, we can immediately continue
+    // with the test for the im871a, without the need for a 1s delay.
+
+    // Talk amb8465 with it...
+    // assumes this device is configured for 9600 bps, which seems to be the default.
+    if (detectAMB8465(&detected, handler) == AccessCheck::AccessOK)
+    {
+        return detected;
+    }
+
+    // Talk im871a with it...
+    // assumes this device is configured for 57600 bps, which seems to be the default.
+    if (detectIM871A(&detected, handler) == AccessCheck::AccessOK)
+    {
+        return detected;
+    }
+
+    // Talk RC1180 with it...
+    // assumes this device is configured for 19200 bps, which seems to be the default.
+    if (detectRC1180(&detected, handler) == AccessCheck::AccessOK)
+    {
+        return detected;
+    }
+
+    // Talk CUL with it...
+    // assumes this device is configured for 38400 bps, which seems to be the default.
+    if (detectCUL(&detected, handler) == AccessCheck::AccessOK)
+    {
+        return detected;
+    }
+
+    // We could not auto-detect either. default is DEVICE_UNKNOWN.
+    return detected;
+}
+
+Detected detectWMBusDeviceWithFile(SpecifiedDevice &specified_device,
+                                   LinkModeSet default_linkmodes,
+                                   shared_ptr<SerialCommunicationManager> handler)
+{
+    assert(specified_device.file != "");
+    assert(specified_device.command == "");
+    debug("(lookup) with file \"%s\"\n", specified_device.file.c_str());
+
+    Detected detected;
+    detected.found_file = specified_device.file;
+    detected.setSpecifiedDevice(specified_device);
+    // If <device>:c1 is missing :c1 then use --c1.
+    LinkModeSet lms = specified_device.linkmodes;
+    if (lms.empty())
+    {
+        lms = default_linkmodes;
+    }
+    if (specified_device.is_simulation)
+    {
+        debug("(lookup) driver: simulation file\n");
+        // A simulation file has a lms of all by default, eg no simulation_foo.txt:t1 nor --t1
+        if (specified_device.linkmodes.empty()) lms.setAll();
+        detected.setAsFound("", DEVICE_SIMULATION, 0 , false, false, lms);
+        return detected;
+    }
+
+    // Special case to cater for /dev/ttyUSB0:9600, ie the rawtty is implicit.
+    if (specified_device.type == WMBusDeviceType::DEVICE_UNKNOWN && specified_device.bps != "" && specified_device.is_tty)
+    {
+        debug("(lookup) driver: rawtty\n");
+        // A rawtty has a lms of all by default, eg no simulation_foo.txt:t1 nor --t1
+        if (specified_device.linkmodes.empty()) lms.setAll();
+        detected.setAsFound("", DEVICE_RAWTTY, atoi(specified_device.bps.c_str()), false, false, lms);
+        return detected;
+    }
+
+    // Special case to cater for raw_data.bin, ie the rawtty is implicit.
+    if (specified_device.type == WMBusDeviceType::DEVICE_UNKNOWN && !specified_device.is_tty)
+    {
+        debug("(lookup) driver: raw file\n");
+        // A rawtty has a lms of all by default, eg no simulation_foo.txt:t1 nor --t1
+        if (specified_device.linkmodes.empty()) lms.setAll();
+        detected.setAsFound("", DEVICE_RAWTTY, 0, true, false, lms);
+        return detected;
+    }
+
+    // Now handle all files with specified type.
+    if (specified_device.type != WMBusDeviceType::DEVICE_UNKNOWN &&
+        specified_device.type != WMBusDeviceType::DEVICE_AUTO &&
+        !specified_device.is_tty)
+    {
+        debug("(lookup) driver: %s\n", toString(specified_device.type));
+        assert(!lms.empty());
+        detected.setAsFound("", specified_device.type, 0, specified_device.is_file || specified_device.is_stdin,
+                            false, lms);
+        return detected;
+    }
+    // Ok, we are left with a single /dev/ttyUSB0 lets talk to it
+    // to figure out what is connected to it.
+    LinkModeSet desired_linkmodes = lms;
+    Detected d = detectWMBusDeviceOnTTY(specified_device.file, desired_linkmodes, handler);
+    if (specified_device.type != d.found_type &&
+        specified_device.type != DEVICE_UNKNOWN)
+    {
+        warning("Expected %s on %s but found %s instead, ignoring it!\n",
+                toLowerCaseString(specified_device.type),
+                specified_device.file.c_str(),
+                toLowerCaseString(d.found_type));
+        d.found_file = specified_device.file;
+        d.found_type = WMBusDeviceType::DEVICE_UNKNOWN;
+    }
+    return d;
+}
+
+Detected detectWMBusDeviceWithCommand(SpecifiedDevice &specified_device,
+                                      LinkModeSet default_linkmodes,
+                                      shared_ptr<SerialCommunicationManager> handler)
+{
+    assert(specified_device.file == "");
+    assert(specified_device.command != "");
+    debug("(lookup) with cmd \"%s\"\n", specified_device.str().c_str());
+
+    Detected detected;
+    detected.found_command = specified_device.command;
+    detected.setSpecifiedDevice(specified_device);
+    LinkModeSet lms = specified_device.linkmodes;
+    // If the specified device did not set any linkmodes fall back on the default linkmodes.
+    if (lms.empty()) lms = default_linkmodes;
+    detected.setAsFound("", specified_device.type, 0, false, true, lms);
+
+    return detected;
+}
+
+AccessCheck detectUNKNOWN(Detected *detected, shared_ptr<SerialCommunicationManager> handler)
+{
+    return AccessCheck::NotThere;
+}
+
+AccessCheck detectSIMULATION(Detected *detected, shared_ptr<SerialCommunicationManager> handler)
+{
+    return AccessCheck::NotThere;
+}
+
+AccessCheck detectAUTO(Detected *detected, shared_ptr<SerialCommunicationManager> handler)
+{
+    // Detection of auto is currently not implemented here, but elsewhere.
+    return AccessCheck::NotThere;
+}
+
+AccessCheck reDetectDevice(Detected *detected, shared_ptr<SerialCommunicationManager> handler)
+{
+    WMBusDeviceType type = detected->specified_device.type;
+
+#define X(name,text,tty,rtlsdr) if (type == WMBusDeviceType::DEVICE_ ## name) return detect ## name(detected,handler);
+LIST_OF_MBUS_DEVICES
+#undef X
+
+    assert(0);
+    return AccessCheck::NotThere;
+}
+
+bool usesRTLSDR(WMBusDeviceType t)
+{
+#define X(name,text,tty,rtlsdr) if (t == WMBusDeviceType::DEVICE_ ## name) return rtlsdr;
+LIST_OF_MBUS_DEVICES
+#undef X
+
+    assert(0);
+    return false;
+}
+
+bool usesTTY(WMBusDeviceType t)
+{
+#define X(name,text,tty,rtlsdr) if (t == WMBusDeviceType::DEVICE_ ## name) return tty;
+LIST_OF_MBUS_DEVICES
+#undef X
+
+    assert(0);
+    return false;
 }

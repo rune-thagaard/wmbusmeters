@@ -7,30 +7,67 @@ MQTT, curled to a REST api, inserted into a database or stored in a log file.
 
 [FAQ/WIKI/MANUAL pages](https://weetmuts.github.io/wmbusmeterswiki/)
 
-The program runs on GNU/Linux, MacOSX and Raspberry Pi.
+The program runs on GNU/Linux, MacOSX, FreeBSD, and Raspberry Pi.
 
 | OS           | Status           |
 | ------------ |:-------------:|
-|GNU/Linux & MacOSX| [![Build Status](https://travis-ci.org/weetmuts/wmbusmeters.svg?branch=master)](https://travis-ci.org/weetmuts/wmbusmeters) |
+|GNU/Linux | [![Build Status](https://travis-ci.org/weetmuts/wmbusmeters.svg?branch=master)](https://travis-ci.org/weetmuts/wmbusmeters) |
+|Docker build status|[![CircleCI>](https://circleci.com/gh/weetmuts/wmbusmeters.svg?style=shield)](https://circleci.com/gh/weetmuts/wmbusmeters)|
+|Snap status|[![wmbusmeters](https://snapcraft.io//wmbusmeters/badge.svg)](https://snapcraft.io/wmbusmeters)|
+
 
 | Static Scan        | Status           |
 | ------------- |:-------------:|
 |Linux G++| [![Build Status](https://scan.coverity.com/projects/14774/badge.svg)](https://scan.coverity.com/projects/weetmuts-wmbusmeters) |
 
+# Distributions
+**wmbusmeters** package is available on [Fedora](https://src.fedoraproject.org/rpms/wmbusmeters) _(version 31 or newer)_ and can be simply installed by using:
+```
+# dnf install wmbusmeters
+```
+Availability of **wmbusmeters** for other Linux distributions can be checked on [release-monitoring](https://release-monitoring.org/project/88654/) project page.
 
 # Run as a daemon
 
-Remove the wmbus dongle (im871a,amb8465,rfmrx2,cul,d1tc) or the generic rtlsdr dongle (RTL2838) from your computer.
+Remove the wmbus dongle (im871a,amb8465,cul,rc1180) or the generic rtlsdr dongle (RTL2838) from your computer.
 
-`make; sudo make install` will install wmbusmeters as a daemon that starts
-automatically when an appropriate wmbus usb dongle is inserted in the computer.
+`./configure; make; sudo make install` will install wmbusmeters as a daemon.
+
+Check the contents of your `/etc/wmbusmeters.conf` file, assuming it
+has `device=auto:c1` and you are using a im871a,amb8465,rc1180 or cul device,
+then you can now start the daemon with `sudo systemctl start wmbusmeters`
+or you can try it from the command line `wmbusmeters auto:c1`
+
+Wmbusmeters will scan for wmbus devices every few seconds and detect whenever
+a device is plugged in or removed.
+
+To have the wmbusmeters daemon start automatically when the computer boots do:
+`sudo systemctl enable wmbusmeters`
+
+You can trigger a reload of the config files with `sudo killall -HUP wmbusmetersd`
+
 (Note! make install only works for GNU/Linux. For MacOSX try to start
 `wmbusmetersd /tmp/thepidfile` from a script instead.)
 
-Check the config file /etc/wmbusmeters.conf:
+Check the config file /etc/wmbusmeters.conf and edit the device. For example:
+`auto:c1` or `im871a:c1` or `im871a[457200101056]:t1` or `/dev/ttyUSB2:amb8465:c1,t1`
+
+Adding a device like auto or im871a will trigger an automatic probe of all serial ttys
+to auto find or to find on which tty the im871a resides.
+
+If you specify a full device path like `/dev/ttyUSB0:im871a:c1` or `rtlwmbus` or `rtl433`
+then it will not probe the serial devices. If you must be really sure that it will not probe something
+you can add `donotprobe=/dev/ttyUSB0` or `donotprobe=all`.
+
+You can specify combinations like: `device=rc1180:t1` `device=auto:c1`
+to set the rc1180 dongle to t1 but any other auto-detected dongle to c1.
+
 ```
 loglevel=normal
-device=auto
+# Search for a wmbus device and set it to c1.
+device=auto:c1
+# But do not probe this serial tty.
+donotprobe=/dev/ttyACM2
 logtelegrams=false
 format=json
 meterfiles=/var/log/wmbusmeters/meter_readings
@@ -39,12 +76,16 @@ meterfilesnaming=name
 meterfilestimestamp=day
 logfile=/var/log/wmbusmeters/wmbusmeters.log
 shell=/usr/bin/mosquitto_pub -h localhost -t wmbusmeters/$METER_ID -m "$METER_JSON"
+alarmshell=/usr/bin/mosquitto_pub -h localhost -t wmbusmeters_alarm -m "$ALARM_TYPE $ALARM_MESSAGE"
+alarmtimeout=1h
+alarmexpectedactivity=mon-sun(00-23)
+ignoreduplicates=false
 ```
 
 Then add a meter file in /etc/wmbusmeters.d/MyTapWater
 ```
 name=MyTapWater
-type=multical21
+type=multical21:c1
 id=12345678
 key=00112233445566778899AABBCCDDEEFF
 ```
@@ -52,7 +93,9 @@ key=00112233445566778899AABBCCDDEEFF
 Now plugin your wmbus dongle. Wmbusmeters should start automatically,
 check with `tail -f /var/log/syslog` and `tail -f /var/log/wmbusmeters/wmbusmeters.log`
 (If you are using an rtlsdr dongle, then make sure the binaries /usr/bin/rtl_sdr and
-/usr/bin/rtl_wmbus exists and are executable.)
+/usr/bin/rtl_wmbus exists and are executable. If not you will see the
+error message `(rtlwmbus) error: when starting as daemon, wmbusmeters expects /usr/bin/rtl_sdr to exist!`
+and the daemon will refuse to start.)
 
 The latest reading of the meter can also be found here: /var/log/wmbusmeters/meter_readings/MyTapWater
 
@@ -93,6 +136,15 @@ Or you can start wmbusmeters with your own config files:
 wmbusmeters --useconfig=/home/me/.config/wmbusmeters
 ```
 
+If you already have config with a device specified, and you want to use
+the config with another device. You might have multiple meters in the config
+that you want to listen to. Then you can add --device to override the settings
+in the config. Like this:
+```
+wmbusmeters --useconfig=/home/me/.config/wmbusmeters --device=rtlwmbus
+```
+You must have both --useconfig= and --device= for it to work.
+
 The files/dir should then be located here:
 `/home/me/.config/wmbusmeters/etc/wmbusmeters.conf` and
 `/home/me/.config/wmbusmeters/etc/wmbusmeters.d`
@@ -103,109 +155,168 @@ depending on if you are running as a daemon or not.
 
 # Running without config files, good for experimentation and test.
 ```
-wmbusmeters version: 0.9.15
-Usage: wmbusmeters {options} <device>{:suffix} ( [meter_name] [meter_type]{:<modes>} [meter_id] [meter_key] )*
+wmbusmeters version: 1.0.3
+Usage: wmbusmeters {options} <device> ( [meter_name] [meter_type]{:<modes>} [meter_id] [meter_key] )*
 
 As <options> you can use:
 
     --addconversions=<unit>+ add conversion to these units to json and meter env variables (GJ)
+    --alarmexpectedactivity=mon-fri(08-17),sat-sun(09-12) Specify when the timeout is tested, default is mon-sun(00-23)
+    --alarmshell=<cmdline> invokes cmdline when an alarm triggers
+    --alarmtimeout=<time> Expect a telegram to arrive within <time> seconds, eg 60s, 60m, 24h during expected activity.
     --debug for a lot of information
+    --donotprobe=<tty> do not auto-probe this tty. Use multiple times for several ttys or specify "all" for all ttys.
     --exitafter=<time> exit program after time, eg 20h, 10m 5s
     --format=<hr/json/fields> for human readable, json or semicolon separated fields
     --json_xxx=yyy always add "xxx"="yyy" to the json output and add shell env METER_xxx=yyy
-    --listento=<mode> tell the wmbus dongle to listen to this single link mode where mode can be
-                      c1,t1,s1,s1m,n1a,n1b,n1c,n1d,n1e,n1f
-    --listento=c1,t1,s1 tell the wmbus dongle to listen to these link modes
-                      different dongles support different combinations of modes
-    --c1 --t1 --s1 --s1m ... another way to set the link mode for the dongle
+    --listenvs=<meter_type> list the env variables available for the given meter type
+    --listfields=<meter_type> list the fields selectable for the given meter type
+    --listmeters list all meter types
+    --listmeters=<search> list all meter types containing the text <search>
     --logfile=<file> use this file instead of stdout
     --logtelegrams log the contents of the telegrams for easy replay
+    --ignoreduplicates ignore duplicate telegrams, remember the last 10 telegrams
     --meterfiles=<dir> store meter readings in dir
     --meterfilesaction=(overwrite|append) overwrite or append to the meter readings file
     --meterfilesnaming=(name|id|name-id) the meter file is the meter's: name, id or name-id
     --meterfilestimestamp=(never|day|hour|minute|micros) the meter file is suffixed with a
                           timestamp (localtime) with the given resolution.
+    --nodeviceexit if no wmbus devices are found, then exit immediately
     --oneshot wait for an update from each meter, then quit
-    --reopenafter=<time> close/reopen dongle connection repeatedly every <time> seconds, eg 60s, 60m, 24h
+    --resetafter=<time> reset the wmbus dongle regularly, default is 23h
+    --selectfields=id,timestamp,total_m3 select fields to be printed
     --separator=<c> change field separator to c
     --shell=<cmdline> invokes cmdline with env variables containing the latest reading
-    --shellenvs list the env variables available for the meter
+    --silent do not print informational messages nor warnings
     --useconfig=<dir> load config files from dir/etc
+    --usestderr write notices/debug/verbose and other logging output to stderr (the default)
+    --usestdoutforlogging write debug/verbose and logging output to stdout
     --verbose for more information
+```
 
 As <device> you can use:
 
-auto, to have wmbusmeters look for the links /dev/im871a, /dev/amb8465, /dev/rfmrx2 and /dev/rtlsdr
-(the links are automatically generated by udev if you have run the install scripts)
+auto:c1, to have wmbusmeters probe for devices: im871a, amb8465, cul, rc1180 or rtlsdr (spawns rtlwmbus).
 
-/dev/ttyUSB0:amb8465, if you have an amb8465 dongle assigned to ttyUSB0. Other suffixes are im871a,rfmrx2,d1tc,cul.
+im871a:c1 to start all connected im871a devices in c1 mode, ignore all other devices.
 
-/dev/ttyUSB0, to have wmbusmeters auto-detect amb8465, im871a or CUL device.
-(The rfmrx2 and the d1tc device cannot be autodetected right now, you have to specify it as a suffix on the device.)
+/dev/ttyUSB1:amb8465:c1 to start only this device on this tty. Do not probe for other devices.
+
+If you have two im871a you can supply both of them with their unique id:s and set different listening modes:
+im871a[12345678]:c1 im871a[11223344]:t1
+
+You can also specify rtlwmbus and if you set the serial in the rtlsdr
+dongle using `rtl_eeprom -s 1234` you can also refer to a specific
+rtlsdr dongle like this `rtlwmbus[1234]`.
+
+/dev/ttyUSB0:amb8465, if you have an amb8465 dongle assigned to ttyUSB0. Other suffixes are im871a,cul.
+
+/dev/ttyUSB0, to have wmbusmeters auto-detect amb8465, im871a, rc1180 or cul device.
 
 /dev/ttyUSB0:38400, to have wmbusmeters set the baud rate to 38400 and listen for raw wmbus telegrams.
+These telegrams are expected to have the data link layer crc bytes removed already!
 
-rtlwmbus, to spawn the background process: "rtl_sdr -f 868.95M -s 1600000 - | rtl_wmbus"
+rtlwmbus, to spawn the background process: "rtl_sdr -f 868.95M -s 1600000 - 2>/dev/null | rtl_wmbus"
+for each attached rtlsdr dongle.
 
 rtlwmbus:868.9M, to tune to this fq instead.
 
-rtlwmbus:<commandline>, to specify the entire background process command line.
+rtl433, to spawn the background process: "rtl_433 -F csv -f 868.95M"
+
+rtl433:868.9M, to tune to this fq instead.
+
+rtlwmbus:CMD(<commandline>), to specify the entire background process command line that is expected to produce rtlwbus compatible output.
+Likewise for rtl433.
 
 stdin, to read raw binary telegrams from stdin.
+These telegrams are expected to have the data link layer crc bytes removed already!
 
-telegrams.txt, to read raw wmbus telegrams from this file.
+telegrams.bin, to read raw wmbus telegrams from this file.
+These telegrams are expected to have the data link layer crc bytes removed already!
 
-stdin:rtlwmbus, to read telegrams formatted using the rtlwmbus format from stdin.
+stdin:rtlwmbus, to read telegrams formatted using the rtlwmbus format from stdin. Works for rtl433 as well.
 
-telegrams.msg:rtlwmbus, to read rtlwmbus formatted telegrams from this file.
+telegrams.msg:rtlwmbus, to read rtlwmbus formatted telegrams from this file. Works for rtl433 as well.
 
-simulation_abc.txt, to read telegrams from the file (which has a name beginning with simulation_)
+simulation_abc.txt, to read telegrams from the file (the file must have a name beginning with simulation_....)
 expecting the same format that is the output from --logtelegrams. This format also supports replay with timing.
 
 As meter quadruples you specify:
 
-<meter_name> a mnemonic for this particular meter
+<meter_name> a mnemonic for this particular meter (!Must not contain a colon ':' character!)
 <meter_type> one of the supported meters
 (can be suffixed with :<mode> to specify which mode you expect the meter to use when transmitting)
 <meter_id> an 8 digit mbus id, usually printed on the meter
 <meter_key> an encryption key unique for the meter
-    if the meter uses no encryption, then supply ""
+    if the meter uses no encryption, then supply NOKEY
 
+```
 Supported wmbus dongles:
-IMST 871a
-Amber 8465
-BMeters RFM-RX2
-rtl_sdr|rtl_wmbus
-CUL family
+IMST 871a (im871a)
+Amber 8465 (amb8465)
+CUL family (cul)
+Radiocraft (RC1180)
+rtl_wmbus (rtlwmbus)
+rtl_433 (rtl433)
 
 Supported water meters:
+Apator at-wmbus-08   (apator08) (non-standard protocol)
+Apator at-wmbus-16-2 (apator162) (non-standard protocol, spurious decoding errors)
+Apator Ultrimis (ultrimis)
+Aquametro/Integra Topas Es Kr (topaseskr)
+Bmeters Hydrodigit (hydrodigit) (partly non-standard protocol)
+Diehl/Sappel IZAR RC 868 I R4 PL (izar) (non-standard protocol)
+Diehl HYDRUS (hydrus)
+Elster Merlin 868 (emerlin868)
+Elster V200H (ev200)
+Honeywell Q400 (q400)
 Kamstrup Multical 21 (multical21)
+Kamstrup flowIQ 2200 (flowiq2200)
 Kamstrup flowIQ 3100 (flowiq3100)
 Sontex Supercom 587 (supercom587)
 Sensus iPERL (iperl)
-Apator at-wmbus-16-2 (apator162) (non-standard protocol)
-Techem MK Radio 3 (mkradio3) (non-standard protocol)
-Diehl/Sappel IZAR RC 868 I R4 PL (izar)
-Diehl HYDRUS (hydrus)
-Bmeters Hydrodigit (hydrodigit) (partly non-standard protocol)
+Techem MK Radio 3 and 4 (mkradio3,mkradio4) (non-standard protocols)
+Waterstar M (waterstarm)
+
+Currently not supported, please help!
+Diehl/Sappel ACQUARIUS/IZAR R3 (izar3)
 
 Supported heat cost allocators:
-Qundis Q caloric (qcaloric)
 Innotas EurisII  (eurisii)
+Qundis Q caloric (qcaloric)
+Sontex 868 (sontex868)
+Techem FHKV data II/III (fhkvdataiii)
 
 Supported heat meter:
+Heat meter Techem Compact V (compact5) (non-standard protocol)
+(compact5 is unfortunately not quite supported since we lack a test telegram to prevent regressions)
 Heat meter Techem Vario 4 (vario451) (non-standard protocol)
 Heat meter Kamstrup Multical 302 (multical302) (in C1 mode, please open issue for T1 mode)
+Heat and Cooling meter Kamstrup Multical 403 (multical403) (in C1 mode)
+Heat and Cooling meter Kamstrup Multical 603 (multical603) (in C1 mode)
+Heat and Cooling meter Kamstrup Multical 803 (multical803) (in C1 mode)
 
 Supported room sensors:
-Lansen Thermometer/Hygrometer (lansenth)
 Bmeters RFM-AMB Thermometer/Hygrometer (rfmamb)
+Elvaco CMa12w Thermometer (cma12w)
+Lansen Thermometer/Hygrometer (lansenth)
+
+Supported smoke detectors:
+Lansen Smoke Detector (lansensm)
+
+Supported door/window detectors:
+Lansen Door/Window Detector (lansendw)
+
+Supported pulse counter:
+Lansen Pulse Counter (lansenpu)
 
 Supported electricity meters:
+Easy Meter ESYS-WM20 (esyswm)
+eBZ wMB-E01 (ebzwmbe)
+EMH Metering (ehzp)
 Tauron Amiplus (amiplus) (includes vendor apator and echelon)
-
-Work in progress:
-Electricity meter Kamstrup Omnipower (omnipower)
+Gavazzi EM24 (em24)
+Kamstrup Omnipower (omnipower)
 ```
 
 The wmbus dongles imst871a can listen to one type of wmbus telegrams
@@ -214,30 +325,34 @@ multiple meters as long as they all require the same radio mode C1 or
 T1.
 
 However if you use amb8465 or rtlwmbus, then you can listen to both C1
-and T1 telegrams at the same time. Unfortunately the original version
-of rtl_wmbus (`https://github.com/xaelsouth/rtl-wmbus.git`) cannot
-reliably listen to C1 telegrams, but the fork
-`https://github.com/afflux/rtl-wmbus.git` can!
+and T1 telegrams at the same time.
 
 # Usage examples
 
 ```
-wmbusmeters --listento=t1 /dev/ttyUSB1:amb8465
+wmbusmeters auto:c1
 ```
 
-Simply runs a scan with mode T1 to search for meters and print the IDs
+Listens for C1 telegrams using any of your available wmbus dongles:
+```
+Received telegram from: 12345678
+          manufacturer: (KAM) Kamstrup Energi (0x2c2d)
+           device type: Cold water meter (0x16)
+            device ver: 0x1b
+                device: im871a[12345678]
+                  rssi: -77 dBm
+                driver: multical21
+```
+
+Now listen to this specific meter.
 
 ```
-wmbusmeters /dev/ttyUSB0:im871a MyTapWater multical21:c1 12345678 00112233445566778899AABBCCDDEEFF
+wmbusmeters auto:c1 MyTapWater multical21:c1 12345678 00112233445566778899AABBCCDDEEFF
 ```
 
-If you have performed `make install` or added the udev rules yourself, then you can use
-auto instead of the exact usb device.
-
-(The :c1 can be left out, since multical21 only transmits c1 telegrams. The suffix
-with the expected link mode might be necessary for other meters, like apator162 for example.
-The Multical21 uses compressed telegrams, which means that you might have to wait up to 8 telegrams
-(8*16 seconds) until you receive a full length telegram which gives all the information needed
+(The Multical21 and other meters use compressed telegrams, which means
+that you might have to wait up to 8 telegrams (8*16 seconds) until you
+receive a full length telegram which gives all the information needed
 to decode the compressed telegrams.)
 
 Example output:
@@ -248,39 +363,57 @@ Example output:
 
 Example format json output:
 
-`wmbusmeters --format=json auto MyTapWater multical21 12345678 00112233445566778899AABBCCDDEEFF MyHeater multical302 22222222 00112233445566778899AABBCCDDEEFF`
+`wmbusmeters --format=json /dev/ttyUSB0:im871a MyTapWater multical21:c1 12345678 00112233445566778899AABBCCDDEEFF MyHeater multical302 22222222 00112233445566778899AABBCCDDEEFF`
 
-`{"media":"cold water","meter":"multical21","name":"MyTapWater","id":"12345678","total_m3":6.388,"target_m3":6.377,"max_flow_m3h":0.000,"flow_temperature":8,"external_temperature":23,"current_status":"DRY","time_dry":"22-31 days","time_reversed":"","time_leaking":"","time_bursting":"","timestamp":"2018-02-08T09:07:22Z"}`
+`{"media":"cold water","meter":"multical21","name":"MyTapWater","id":"12345678","total_m3":6.388,"target_m3":6.377,"max_flow_m3h":0.000,"flow_temperature":8,"external_temperature":23,"current_status":"DRY","time_dry":"22-31 days","time_reversed":"","time_leaking":"","time_bursting":"","timestamp":"2018-02-08T09:07:22Z","device":"im871a[1234567]","rssi_dbm":-40}`
 
 `{"media":"heat","meter":"multical302","name":"MyHeater","id":"22222222","total_kwh":0.000,"total_volume_m3":0.000,"current_kw":"0.000","timestamp":"2018-02-08T09:07:22Z"}`
 
 Example format fields output and use rtlsdr dongle with rtlwmbus tuned to 868.9MHz instead of the
 default 868.95MHz.
 
-`wmbusmeters --format=fields rtlwmbus:868.9M GreenhouseWater multical21 33333333 ""`
+`wmbusmeters --format=fields rtlwmbus:868.9M GreenhouseWater multical21:c1 33333333 NOKEY`
 
 `GreenhouseTapWater;33333333;9999.099;77.712;0.000;11;31;;2018-03-05 12:10.24`
 
+You can select a subset of all available fields:
+
+`wmbusmeters --format=fields --selectfields=id,total_m3 /dev/ttyUSB0:im871a GreenhouseWater multical21:c1 33333333 NOKEY`
+
+`33333333;9999.099`
+
+You can list all available fields for a meter: `wmbusmeters --listfields=multical21`
+
+You can list all meters: `wmbusmeters --listmeters`
+
+You can search for meters: `wmbusmeters --listmeters=water` or `wmbusmteres --listmeters=q`
+
 Eaxmple of using the shell command to publish to MQTT:
 
-`wmbusmeters --shell='HOME=/home/you mosquitto_pub -h localhost -t water -m "$METER_JSON"' auto GreenhouseWater multical21 33333333 ""`
+`wmbusmeters --shell='HOME=/home/you mosquitto_pub -h localhost -t water -m "$METER_JSON"' /dev/ttyUSB0:im871a GreenhouseWater multical21:c1 33333333 NOKEY`
 
 Eaxmple of using the shell command to inject data into postgresql database:
 
-`wmbusmeters --shell="psql waterreadings -c \"insert into readings values ('\$METER_ID',\$METER_TOTAL_M3,'\$METER_TIMESTAMP') \" " auto MyColdWater multical21 12345678 ""`
+`wmbusmeters --shell="psql waterreadings -c \"insert into readings values ('\$METER_ID',\$METER_TOTAL_M3,'\$METER_TIMESTAMP') \" " /dev/ttyUSB0:amb8465 MyColdWater multical21:c1 12345678 NOKEY` (It is much easier to add shell commands in the conf file since you do not need to quote the quotes.)
 
 You can have multiple shell commands and they will be executed in the order you gave them on the commandline.
-Note that to single quotes around the command is necessary to pass the env variable names into wmbusmeters.
-To list the shell env variables available for your meter, add --shellenvs to the commandline:
-`wmbusmeters --shellenvs auto Water iperl 12345678 ""`
-which outputs:
+
+To list the shell env variables available for a meter, run `wmbusmeters --listenvs=multical21` which outputs:
 ```
-Environment variables provided to shell for meter iperl:
 METER_JSON
 METER_TYPE
+METER_NAME
 METER_ID
 METER_TOTAL_M3
+METER_TARGET_M3
 METER_MAX_FLOW_M3H
+METER_FLOW_TEMPERATURE_C
+METER_EXTERNAL_TEMPERATURE_C
+METER_CURRENT_STATUS
+METER_TIME_DRY
+METER_TIME_REVERSED
+METER_TIME_LEAKING
+METER_TIME_BURSTING
 METER_TIMESTAMP
 ```
 (If you have supplied --json_floor=5 then you will also see METER_floor in the list)
@@ -293,30 +426,33 @@ this shell command instead of the command stored in wmbusmeters.conf.
 
 You can use `--debug` to get both verbose output and the actual data bytes sent back and forth with the wmbus usb dongle.
 
-If the meter does not use encryption of its meter data, then enter an empty key on the command line.
-(you must enter "")
+If the meter does not use encryption of its meter data, then enter NOKEY on the command line.
 
-`wmbusmeters --format=json --meterfiles auto MyTapWater multical21 12345678 ""`
+`wmbusmeters --format=json --meterfiles /dev/ttyUSB0:im871a:c1 MyTapWater multical21:c1 12345678 NOKEY`
 
-If you have a Kamstrup meters and you have received a KEM file and its password from your supplier, then you can use [utils/kem-import.py](utils/kem-import.py) utility to extract meter information from that file (including the AES key) and to create corresponding meter files in wmbusmetrs' config directory.
+If you have a Kamstrup meters and you have received a KEM file and its
+password from your supplier, then you can use
+[utils/kem-import.py](utils/kem-import.py) utility to extract meter
+information from that file (including the AES key) and to create
+corresponding meter files in wmbusmetrs' config directory.
 
-You can run wmbusmeters with --logtelegrams to get log output that can be placed in a simulation.txt
-file. You can then run wmbusmeter and instead of auto (or an usb device) provide the simulationt.xt
-file as argument. See test.sh for more info.
+You can run wmbusmeters with --logtelegrams to get log output that can
+be placed in a simulation.txt file. You can then run wmbusmeter and
+instead of an usb device, you provide the simulationt.xt file as
+argument. See test.sh for more info.
 
 If you do not specify any meters on the command line, then wmbusmeters
 will listen and print the header information of any telegram it hears.
-You must specify the listening mode.
 
-With an rtlwmbus or amb8465 dongle: `wmbusmeters --listento=c1,t1 auto`
+# Builds and runs on GNU/Linux MacOSX (with recent XCode), and FreeBSD
+(For MacOSX do `brew install librtlsdr libusb` which takes such a long
+time that the MacOSX travis build is disabled for the moment.)
 
-With an imst871a dongle: `wmbusmeters --listento=c1 auto`
-
-# Builds and runs on GNU/Linux and MacOSX (with recent XCode)
-
-`make && make test`
+`./configure && make && make test`
 
 Binary generated: `./build/wmbusmeters`
+
+`make install` will install this binary.
 
 `make HOST=arm` to cross compile from GNU/Linux to Raspberry PI.
 
@@ -326,14 +462,15 @@ Binary generated: `./build_arm/wmbusmeters`
 
 Binary generated: `./build_debug/wmbusmeters`
 
+`make testd` to run all tests using the debug build.
+
+Debug builds only work on FreeBSD if the compiler is LLVM. If your
+system default compiler is gcc, set `CXX=clang++` to the build
+environment to force LLVM to be used.
+
 `make DEBUG=true HOST=arm`
 
 Binary generated: `./build_arm_debug/wmbusmeters`
-
-`make HOST=arm dist`
-
-(Work in progress...)
-Binary generated: `./wmbusmeters_0.8_armhf.deb`
 
 # System configuration
 
@@ -343,7 +480,6 @@ Binary generated: `./wmbusmeters_0.8_armhf.deb`
 `/usr/bin/wmbusmeters`
 `/usr/sbin/wmbusmetersd`
 `/etc/systemd/system/wmbusmeters.service`
-`/etc/udev/rules.d/99-wmbus-usb-serial.rules`
 `/etc/logrotate.d/wmbusmeters`
 
 creates these directories:
@@ -352,19 +488,51 @@ creates these directories:
 
 and adds the user `wmbusmeters` with no login account.
 
-This means that when a im871a/amb8465 dongle is inserted, then the
-appropriate /dev/im871a or /dev/amb8465 link is created. Also the
-wmbusmeters daemon will be automatically started/stopped whenever the
-im871a/amb8465 dongle is inserted/removed, and the daemon starts when
-the computer boots, if the dongle is already inserted.
+# Common problems
 
-If you do not want the daemon to start automatically, simply edit
-/dev/udev/rules.d/99-wmbus-usb-serial.rules and remove
-`,TAG+="systemd",ENV{SYSTEMD_WANTS}="wmbusmeters.service"` from each
-line.
+If the daemon has started then the wmbus device will be taken and you cannot start wmbusmeters manually.
 
-You can also start/stop the daemon with `sudo systemctl start wmbusmeters`
-and trigger the daemon to reload the config files with `sudo killall -HUP wmbusmetersd`
+To run manually, first make sure the daemon is stopped `sudo stop wmbusmeters@-dev-im871a_0.server`
+if this hangs, then do `sudo killall -9 wmbusmetersd` and/or `sudo killall -9 wmbusmeters`.
+
+If you are using rtl_sdr/rtl_wmbus and you want to stop the daemon, do
+`sudo stop wmbusmeters@-dev-rtlsdr_3.server` followed by `sudo killall -9 rtl_sdr`.
+
+## How to receive telegrams over longer distances.
+
+I only have personal experience of the im871a,amb8465 and an rtlsdr
+compatible dongle.  The commercial dongles (im871a,amb8464) receive
+well despite having tiny antennas inside the dongle. However the
+reception range is limited by walls and you must definitely get quite
+close to the meter if it is mounted underground in a concrete tube.
+
+The rtlsdr/rtl-wmbus solution seems to work for a lot of users, but it
+does use more cpu-power since it decodes the radio traffic in
+software. Range seems to be similar to the other dongles, despite the
+antenna being much larger.
+
+At least one professional collector use the same commercial dongles,
+but the versions with an external antenna connector, into which they
+attach a radio amplifier for the proper frequency, and then a larger
+antennna. This makes it possible to receive telegrams from meters
+underground and over larger distances.
+
+## Non-standard baud rate set for AMB8465 USB stick
+
+Wmbusmeters expects the serial baud rate for the AMB8465 USB stick to be 9600 8n1.
+If you have used another tool and changed the baud rate to something else
+you need to restore the baud rate to 9600 8n1. You can do that with that other tool,
+or you can try wmbusmeters-admin and select `Reset wmbus receives`
+this command try all potential baud rates and send the factory reset command.
+Then you have to unplug and reinsert the dongle.
+
+If you like to send the bytes manually, the correct bytes are:
+ * Factory reset of the settings: `0xFF1100EE`
+ * Reset the stick to apply the factory defaults: `0xFF0500FA` this is not necessary if you unplug and reinsert the dongle.
+
+# Docker
+
+Experimental docker containers are available here: https://hub.docker.com/r/weetmuts/wmbusmeters
 
 # Source code
 
@@ -378,30 +546,10 @@ If you do not get proper readings from the meters with non-standard protocols. a
 then you have to open an issue here and help out by logging a lot of messages and reverse engineer them
 even more..... :-/
 
-# Good documents on the wireless mbus protocol:
+# Good free documents on the wireless mbus protocol standard EN 13757:
 
-https://oms-group.org/download4all/
-
-http://www.m-bus.com/files/w4b21021.pdf
-
-https://www.infineon.com/dgdl/TDA5340_AN_WMBus_v1.0.pdf
-
-http://fastforward.ag/downloads/docu/FAST_EnergyCam-Protocol-wirelessMBUS.pdf
-
-http://www.multical.hu/WiredMBus-water.pdf
-
-http://uu.diva-portal.org/smash/get/diva2:847898/FULLTEXT02.pdf
-
-http://projekter.aau.dk/projekter/da/studentthesis/wireless-mbus-based-extremely-low-power-protocol-for-wireless-communication-with-water-meters(6e1139d5-6f24-4b8a-a727-9bc108012bcc).html
-
-The AES source code is copied from:
-
-https://github.com/kokke/tiny-AES128-C
-
-TODO: CRC checks are still missing. If the wrong AES key
-is supplied you probably get zero readings and
-sometimes warnings about wrong type of frames.
+https://oms-group.org/
 
 There is also a lot of wmbus protocol implementation details that
-probably are missing. They will be added to the program
-as we figure out how the meters send their data.
+are missing. They will be added to the program as we figure out
+how the meters send their data.

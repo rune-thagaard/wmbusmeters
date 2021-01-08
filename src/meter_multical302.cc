@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2018-2019 Fredrik Öhrström
+ Copyright (C) 2018-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -31,7 +31,7 @@
 #define INFO_CODE_VOLTAGE_TOO_LOW 128
 
 struct MeterMultical302 : public virtual HeatMeter, public virtual MeterCommonImplementation {
-    MeterMultical302(WMBus *bus, MeterInfo &mi);
+    MeterMultical302(MeterInfo &mi);
 
     double totalEnergyConsumption(Unit u);
     double targetEnergyConsumption(Unit u);
@@ -51,12 +51,10 @@ private:
     string target_date_ {};
 };
 
-MeterMultical302::MeterMultical302(WMBus *bus, MeterInfo &mi) :
-    MeterCommonImplementation(bus, mi, MeterType::MULTICAL302, MANUFACTURER_KAM)
+MeterMultical302::MeterMultical302(MeterInfo &mi) :
+    MeterCommonImplementation(mi, MeterType::MULTICAL302)
 {
-    setEncryptionMode(EncryptionMode::AES_CTR);
-
-    addMedia(0x04); // Heat media
+    setExpectedELLSecurityMode(ELLSecurityMode::AES_CTR);
 
     addLinkMode(LinkMode::C1);
 
@@ -65,7 +63,7 @@ MeterMultical302::MeterMultical302(WMBus *bus, MeterInfo &mi) :
              "The total energy consumption recorded by this meter.",
              true, true);
 
-   addPrint("current_power_consumption", Quantity::Power,
+    addPrint("current_power_consumption", Quantity::Power,
              [&](Unit u){ return currentPowerConsumption(u); },
              "Current power consumption.",
              true, true);
@@ -89,12 +87,10 @@ MeterMultical302::MeterMultical302(WMBus *bus, MeterInfo &mi) :
              [&](){ return status(); },
              "Status of meter.",
              true, true);
-
-    MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
 }
 
-unique_ptr<HeatMeter> createMultical302(WMBus *bus, MeterInfo &mi) {
-    return unique_ptr<HeatMeter>(new MeterMultical302(bus, mi));
+shared_ptr<HeatMeter> createMultical302(MeterInfo &mi) {
+    return shared_ptr<HeatMeter>(new MeterMultical302(mi));
 }
 
 double MeterMultical302::totalEnergyConsumption(Unit u)
@@ -146,97 +142,39 @@ void MeterMultical302::processContent(Telegram *t)
       (multical302) 2d: 21 vife (per minute)
       (multical302) 2e: * 00 info codes (00)
     */
-    map<string,pair<int,DVEntry>> values;
-
-    vector<uchar>::iterator bytes = t->content.begin();
-
-    int crc0 = t->content[0];
-    int crc1 = t->content[1];
-    t->addExplanation(bytes, 2, "%02x%02x payload crc", crc0, crc1);
-
-    int frame_type = t->content[2];
-    t->addExplanation(bytes, 1, "%02x frame type (%s)", frame_type, frameTypeKamstrupC1(frame_type).c_str());
-
-    if (frame_type == 0x79) {
-        // This is a "compact frame" in wmbus lingo.
-        // (Other such frame_types are Ci=0x69, 0x6a, 0x6b and Ci=0x79, 0x7b, compact frames and format frames)
-        // 0,1 = crc for format signature = hash over DRH (Data Record Header)
-        // The DRH is the dif(difes)vif(vifes) bytes for all the records...
-        // This hash is used to find the suitable format string, that has been previously
-        // seen in a long frame telegram.
-        uchar ecrc0 = t->content[3];
-        uchar ecrc1 = t->content[4];
-        t->addExplanation(bytes, 2, "%02x%02x format signature", ecrc0, ecrc1);
-        uint16_t format_signature = ecrc1<<8 | ecrc0;
-
-        vector<uchar> format_bytes;
-        bool ok = loadFormatBytesFromSignature(format_signature, &format_bytes);
-        if (!ok) {
-
-            // We have not yet seen a long frame, but we know the formats for these
-            // particular hashes:
-            if (format_signature == 0xf1e7)
-            {
-                hex2bin("030643060314426C022D01FF21", &format_bytes);
-                debug("(multical302) using hard coded format for hash f1e7\n");
-            }
-            else
-            {
-                verbose("(%s) ignoring telegram since format signature hash 0x%02x is yet unknown.\n",
-                        "multical302",  format_signature);
-                return;
-            }
-        }
-        vector<uchar>::iterator format = format_bytes.begin();
-
-        // 2,3 = crc for payload = hash over both DRH and data bytes. Or is it only over the data bytes?
-        int ecrc2 = t->content[5];
-        int ecrc3 = t->content[6];
-        t->addExplanation(bytes, 2, "%02x%02x data crc", ecrc2, ecrc3);
-        parseDV(t, t->content, t->content.begin()+7, t->content.size()-7, &values, &format, format_bytes.size());
-    }
-    else if (frame_type == 0x78)
-    {
-        parseDV(t, t->content, t->content.begin()+3, t->content.size()-3, &values);
-    }
-    else {
-        warning("(multical302) warning: unknown frame %02x (did you use the correct encryption key?)\n", frame_type);
-        return;
-    }
 
     int offset;
     string key;
 
-    extractDVuint8(&values, "01FF21", &offset, &info_codes_);
+    extractDVuint8(&t->values, "01FF21", &offset, &info_codes_);
     t->addMoreExplanation(offset, " info codes (%s)", status().c_str());
 
-    if(findKey(MeasurementType::Instantaneous, ValueInformation::EnergyWh, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &total_energy_kwh_);
+    if(findKey(MeasurementType::Instantaneous, ValueInformation::EnergyWh, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &total_energy_kwh_);
         t->addMoreExplanation(offset, " total energy consumption (%f kWh)", total_energy_kwh_);
     }
 
-    if(findKey(MeasurementType::Instantaneous, ValueInformation::Volume, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &total_volume_m3_);
+    if(findKey(MeasurementType::Instantaneous, ValueInformation::Volume, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &total_volume_m3_);
         t->addMoreExplanation(offset, " total volume (%f m3)", total_volume_m3_);
     }
 
-    if(findKey(MeasurementType::Instantaneous, ValueInformation::EnergyWh, 1, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &target_energy_kwh_);
+    if(findKey(MeasurementType::Instantaneous, ValueInformation::EnergyWh, 1, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &target_energy_kwh_);
         t->addMoreExplanation(offset, " target energy consumption (%f kWh)", target_energy_kwh_);
     }
 
-    if(findKey(MeasurementType::Instantaneous, ValueInformation::PowerW, 0, &key, &values)) {
-        extractDVdouble(&values, key, &offset, &current_power_kw_);
+    if(findKey(MeasurementType::Instantaneous, ValueInformation::PowerW, 0, 0, &key, &t->values)) {
+        extractDVdouble(&t->values, key, &offset, &current_power_kw_);
         t->addMoreExplanation(offset, " current power consumption (%f kW)", current_power_kw_);
     }
 
-    if (findKey(MeasurementType::Unknown, ValueInformation::Date, 1, &key, &values)) {
+    if (findKey(MeasurementType::Unknown, ValueInformation::Date, 1, 0, &key, &t->values)) {
         struct tm datetime;
-        extractDVdate(&values, key, &offset, &datetime);
+        extractDVdate(&t->values, key, &offset, &datetime);
         target_date_ = strdatetime(&datetime);
         t->addMoreExplanation(offset, " target date (%s)", target_date_.c_str());
     }
-
 }
 
 string MeterMultical302::status()

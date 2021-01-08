@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -23,12 +23,7 @@
 #include <memory.h>
 #include <pthread.h>
 #include <sys/types.h>
-#if defined(__APPLE__) && defined(__MACH__)
 #include <sys/wait.h>
-#else
-#include <wait.h>
-#endif
-
 #include <unistd.h>
 
 void invokeShell(string program, vector<string> args, vector<string> envs)
@@ -61,7 +56,7 @@ void invokeShell(string program, vector<string> args, vector<string> envs)
     if (pid == 0) {
         // I am the child!
         close(0); // Close stdin
-#if defined(__APPLE__) && defined(__MACH__)
+#if (defined(__APPLE__) && defined(__MACH__)) || defined(__FreeBSD__)
         execve(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
 #else
         execvpe(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
@@ -121,6 +116,13 @@ bool invokeBackgroundShell(string program, vector<string> args, vector<string> e
     *pid = fork();
     if (*pid == 0) {
         // I am the child!
+        // Restore the handlers in the child.
+        restoreSignalHandlers();
+
+        // Make this child a process group leader,
+        // so that we can easily terminate it and all its
+        // subprocesses later one!
+        setpgid(0, 0);
         // Redirect stdout and stderr to pipe
         dup2 (link[1], STDOUT_FILENO);
         dup2 (link[1], STDERR_FILENO);
@@ -130,7 +132,7 @@ bool invokeBackgroundShell(string program, vector<string> args, vector<string> e
         close(link[1]);
         close(0); // Close stdin
 
-#if defined(__APPLE__) && defined(__MACH__)
+#if (defined(__APPLE__) && defined(__MACH__)) || defined(__FreeBSD__)
         execve(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
 #else
         execvpe(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
@@ -184,24 +186,19 @@ void stopBackgroundShell(int pid)
 {
     assert(pid > 0);
 
-    // This will actually stop the entire process group.
-    // But it is ok, for now, since this function is
-    // only called when wmbusmeters is exiting.
-
-    // If we send sigint only to pid, then this will
-    // not always propagate properly to the child processes
-    // of the bgshell, ie rtl_sdr and rtl_wmbus, thus
-    // leaving those hanging in limbo and messing everything up.
-    // The solution for now is to send sigint to 0, which
-    // menas send sigint to the whole process group that the
-    // sender belongs to.
-    int rc = kill(0, SIGINT);
+    // Sending SIGTERM to the pid will properly shut down the subshell
+    // and its contents.
+    // You can check process group ids for rtl_sdr|rtl_wmbus using this command,
+    // replace rtl with whatever it is that you start inside the subshell.
+    //    ps -axcf -o pid,ppid,pgid,comm  | grep -B 10 -A 10 rtl
+    debug("(shell) sending SIGTERM to process group %d\n", pid);
+    int rc = kill(-pid, SIGTERM);
     if (rc < 0) {
-        debug("(bgshell) could not sigint pid %d, exited already?\n", pid);
+        debug("(bgshell) could not sigterm -%d, exited already?\n", pid);
         return;
     }
     // Wait for the child to finish!
-    debug("(bgshell) sent sigint, now waiting for child %d to exit.\n", pid);
+    debug("(bgshell) sent sigterm, now waiting for child %d to exit.\n", pid);
     int status;
     int p = waitpid(pid, &status, 0);
     if (p < 0) {
@@ -222,5 +219,129 @@ void stopBackgroundShell(int pid)
     } else
     {
         debug("(bgshell) %d exited\n", pid);
+    }
+}
+
+int invokeShellCaptureOutput(string program, vector<string> args, vector<string> envs, string *out, bool do_not_warn_if_fail)
+{
+    int rc = 0;
+    int pid;
+    int link[2];
+    vector<const char*> argv(args.size()+2);
+    char *p = new char[program.length()+1];
+    strcpy(p, program.c_str());
+    argv[0] = p;
+    int i = 1;
+
+    debug("(shell) exec (capture output) \"%s\"\n", program.c_str());
+    for (auto &a : args) {
+        argv[i] = a.c_str();
+        i++;
+        debug("(shell) arg \"%s\"\n", a.c_str());
+    }
+    argv[i] = NULL;
+
+    vector<const char*> env(envs.size()+1);
+    env[0] = p;
+    i = 0;
+    for (auto &e : envs) {
+        env[i] = e.c_str();
+        i++;
+        debug("(shell) env \"%s\"\n", e.c_str());
+    }
+    env[i] = NULL;
+
+    if (pipe(link) == -1) {
+        error("(shell) could not create pipe!\n");
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        // I am the child!
+        // Redirect stdout and stderr to pipe
+        dup2 (link[1], STDOUT_FILENO);
+        dup2 (link[1], STDERR_FILENO);
+        // Close return pipe, not duped.
+        close(link[0]);
+        // Close old forward fd pipe.
+        close(link[1]);
+        close(0); // Close stdin
+
+#if (defined(__APPLE__) && defined(__MACH__)) || defined(__FreeBSD__)
+        execve(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
+#else
+        execvpe(program.c_str(), (char*const*)&argv[0], (char*const*)&env[0]);
+#endif
+
+        perror("Execvp failed:");
+        error("(shell) invoking %s failed!\n", program.c_str());
+        return 127;
+    }
+
+    close(link[1]);
+
+    int fd_out = link[0];
+    delete[] p;
+
+    string data;
+    uchar buf[32768];
+    for(;;)
+    {
+        ssize_t n = read(fd_out, buf, sizeof(buf));
+        if (n <= 0)
+        {
+            break;
+        }
+        data.insert(data.end(), buf, buf+n);
+    }
+
+    debug("(shell) output: >>>%s<<<\n", data.c_str());
+
+    *out = data;
+
+    int status;
+    int pp = waitpid(pid, &status, 0);
+    if (pp < 0) {
+        debug("(shell) cannot stop pid %d, exited already?\n", pid);
+        return 127;
+    }
+    if (WIFEXITED(status)) {
+        // Child exited properly.
+        rc = WEXITSTATUS(status);
+        debug("(shell) return code %d\n", rc);
+        if (rc != 0) {
+            if (!do_not_warn_if_fail)
+            {
+                warning("(shell) exited with non-zero return code: %d\n", rc);
+            }
+        }
+    }
+    if (WIFSIGNALED(status)) {
+        // Child forcefully terminated
+        debug("(shell) %d terminated due to signal %d\n", pid,  WTERMSIG(status));
+    } else
+    {
+        debug("(shell) %d exited\n", pid);
+    }
+
+    return rc;
+}
+
+void detectProcesses(string cmd, vector<int> *pids)
+{
+    vector<string> args;
+    vector<string> envs;
+    args.push_back(cmd);
+    string out;
+    invokeShellCaptureOutput("/bin/pidof", args, envs, &out, true);
+
+    char buf[out.size()+1];
+    strcpy(buf, out.c_str());
+    char *pch;
+    pch = strtok (buf," \n");
+    while (pch != NULL)
+    {
+        pids->push_back(atoi(pch));
+        pch = strtok (NULL, " \n");
     }
 }

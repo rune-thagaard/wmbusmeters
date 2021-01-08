@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -17,6 +17,11 @@
 
 #include"util.h"
 #include"meters.h"
+#include"shell.h"
+#include"version.h"
+
+#include<algorithm>
+#include<assert.h>
 #include<dirent.h>
 #include<functional>
 #include<grp.h>
@@ -26,7 +31,7 @@
 #include<stddef.h>
 #include<string.h>
 #include<string>
-#include<sys/errno.h>
+#include<errno.h>
 #include<sys/stat.h>
 #include<sys/time.h>
 #include<syslog.h>
@@ -133,6 +138,23 @@ int char2int(char input)
     return -1;
 }
 
+// The byte 0x13 i converted into the integer value 13.
+uchar bcd2bin(uchar c)
+{
+    return (c&15)+(c>>4)*10;
+}
+
+// The byte 0x13 is converted into the integer value 31.
+uchar revbcd2bin(uchar c)
+{
+    return (c&15)*10+(c>>4);
+}
+
+uchar reverse(uchar c)
+{
+    return ((c&15)<<4) | (c>>4);
+}
+
 bool hex2bin(const char* src, vector<uchar> *target)
 {
     if (!src) return false;
@@ -208,6 +230,18 @@ std::string safeString(vector<uchar> &target) {
     return str;
 }
 
+string tostrprintf(const char* fmt, ...)
+{
+    string s;
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, 4095, fmt, args);
+    va_end(args);
+    s = buf;
+    return s;
+}
+
 void strprintf(std::string &s, const char* fmt, ...)
 {
     char buf[4096];
@@ -223,6 +257,19 @@ void xorit(uchar *srca, uchar *srcb, uchar *dest, int len)
     for (int i=0; i<len; ++i) { dest[i] = srca[i]^srcb[i]; }
 }
 
+void shiftLeft(uchar *srca, uchar *srcb, int len)
+{
+    uchar overflow = 0;
+
+    for (int i = len-1; i >= 0; i--)
+    {
+        srcb[i] = srca[i] << 1;
+        srcb[i] |= overflow;
+        overflow = (srca[i] & 0x80) >> 7;
+    }
+    return;
+}
+
 string format3fdot3f(double v)
 {
     string r;
@@ -232,15 +279,18 @@ string format3fdot3f(double v)
 
 bool syslog_enabled_ = false;
 bool logfile_enabled_ = false;
-bool warning_enabled_ = true;
+bool logging_silenced_ = false;
 bool verbose_enabled_ = false;
 bool debug_enabled_ = false;
+bool trace_enabled_ = false;
+bool stderr_enabled_ = false;
 bool log_telegrams_enabled_ = false;
+bool internal_testing_enabled_ = false;
 
 string log_file_;
 
-void warningSilenced(bool b) {
-    warning_enabled_ = !b;
+void silentLogging(bool b) {
+    logging_silenced_ = b;
 }
 
 void enableSyslog() {
@@ -258,7 +308,7 @@ bool enableLogfile(string logfile, bool daemon)
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
         int n = 0;
         if (daemon) {
-            n = fprintf(output, "(wmbusmeters) logging started %s\n", buf);
+            n = fprintf(output, "(wmbusmeters) logging started %s using " VERSION "\n", buf);
             if (n == 0) {
                 logfile_enabled_ = false;
                 return false;
@@ -288,11 +338,34 @@ void debugEnabled(bool b) {
     }
 }
 
+void traceEnabled(bool b) {
+    trace_enabled_ = b;
+    if (trace_enabled_) {
+        debug_enabled_ = b;
+        verbose_enabled_ = true;
+        log_telegrams_enabled_ = true;
+    }
+}
+
+void stderrEnabled(bool b) {
+    stderr_enabled_ = b;
+}
+
 time_t telegrams_start_time_;
 
 void logTelegramsEnabled(bool b) {
     log_telegrams_enabled_ = b;
     telegrams_start_time_ = time(NULL);
+}
+
+void internalTestingEnabled(bool b)
+{
+    internal_testing_enabled_ = b;
+}
+
+bool isInternalTestingEnabled()
+{
+    return internal_testing_enabled_;
 }
 
 bool isVerboseEnabled() {
@@ -332,27 +405,39 @@ void outputStuff(int syslog_level, const char *fmt, va_list args)
     if (syslog_enabled_) {
         vsyslog(syslog_level, fmt, args);
     }
-    else {
-        vprintf(fmt, args);
+    else
+    {
+        if (stderr_enabled_)
+        {
+            vfprintf(stderr, fmt, args);
+        }
+        else
+        {
+            vprintf(fmt, args);
+        }
     }
 }
 
 void info(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    outputStuff(LOG_INFO, fmt, args);
-    va_end(args);
+    if (!logging_silenced_) {
+        va_list args;
+        va_start(args, fmt);
+        outputStuff(LOG_INFO, fmt, args);
+        va_end(args);
+    }
 }
 
 void notice(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    outputStuff(LOG_NOTICE, fmt, args);
-    va_end(args);
+    if (!logging_silenced_) {
+        va_list args;
+        va_start(args, fmt);
+        outputStuff(LOG_NOTICE, fmt, args);
+        va_end(args);
+    }
 }
 
 void warning(const char* fmt, ...) {
-    if (warning_enabled_) {
+    if (!logging_silenced_) {
         va_list args;
         va_start(args, fmt);
         outputStuff(LOG_WARNING, fmt, args);
@@ -371,6 +456,15 @@ void verbose(const char* fmt, ...) {
 
 void debug(const char* fmt, ...) {
     if (debug_enabled_) {
+        va_list args;
+        va_start(args, fmt);
+        outputStuff(LOG_NOTICE, fmt, args);
+        va_end(args);
+    }
+}
+
+void trace(const char* fmt, ...) {
+    if (trace_enabled_) {
         va_list args;
         va_start(args, fmt);
         outputStuff(LOG_NOTICE, fmt, args);
@@ -461,6 +555,22 @@ bool isValidMatchExpressions(string mes, bool non_compliant)
     return true;
 }
 
+bool isValidId(string id, bool accept_non_compliant)
+{
+
+    for (size_t i=0; i<id.length(); ++i)
+    {
+        if (id[i] >= '0' && id[i] <= '9') continue;
+        if (accept_non_compliant)
+        {
+            if (id[i] >= 'a' && id[i] <= 'f') continue;
+            if (id[i] >= 'A' && id[i] <= 'F') continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool doesIdMatchExpression(string id, string match)
 {
     if (id.length() == 0) return false;
@@ -483,7 +593,7 @@ bool doesIdMatchExpression(string id, string match)
     }
 
     bool wildcard_used = false;
-    if (match.front() == '*')
+    if (match.length() && match.front() == '*')
     {
         wildcard_used = true;
         match.erase(0,1);
@@ -550,6 +660,10 @@ bool doesIdMatchExpressions(string& id, vector<string>& mes)
 bool isValidKey(string& key, MeterType mt)
 {
     if (key.length() == 0) return true;
+    if (key == "NOKEY") {
+        key = "";
+        return true;
+    }
     if ((mt == MeterType::IZAR && key.length() != 16) ||
         (mt != MeterType::IZAR && key.length() != 32)) return false;
     vector<uchar> tmp;
@@ -560,7 +674,8 @@ bool isFrequency(std::string& fq)
 {
     int len = fq.length();
     if (len == 0) return false;
-    if (fq[len-1] == 'M') len--;
+    if (fq[len-1] != 'M') return false;
+    len--;
     for (int i=0; i<len; ++i) {
         if (!isdigit(fq[i]) && fq[i] != '.') return false;
     }
@@ -692,14 +807,36 @@ void debugPayload(string intro, vector<uchar> &payload)
     }
 }
 
-void logTelegram(string intro, vector<uchar> &header, vector<uchar> &content)
+void debugPayload(string intro, vector<uchar> &payload, vector<uchar>::iterator &pos)
+{
+    if (isDebugEnabled())
+    {
+        string msg = bin2hex(pos, payload.end(), 1024);
+        debug("%s \"%s\"\n", intro.c_str(), msg.c_str());
+    }
+}
+
+void logTelegram(vector<uchar> &parsed, int header_size, int suffix_size)
 {
     if (isLogTelegramsEnabled())
     {
-        string h = bin2hex(header);
-        string cntnt = bin2hex(content);
         time_t diff = time(NULL)-telegrams_start_time_;
-        notice("%s \"telegram=|%s|%s|+%ld\"\n", intro.c_str(), h.c_str(), cntnt.c_str(), diff);
+        string parsed_hex = bin2hex(parsed);
+        string header = parsed_hex.substr(0, header_size*2);
+        string content = parsed_hex.substr(header_size*2);
+        if (suffix_size == 0)
+        {
+            notice("telegram=|%s|%s|+%ld\n",
+                   header.c_str(), content.c_str(), diff);
+        }
+        else
+        {
+            assert((suffix_size*2) < (int)content.size());
+            string content2 = content.substr(0, content.size()-suffix_size*2);
+            string suffix = content.substr(content.size()-suffix_size*2);
+            notice("telegram=|%s|%s|%s|+%ld\n",
+                   header.c_str(), content2.c_str(), suffix.c_str(), diff);
+        }
     }
 }
 
@@ -740,6 +877,15 @@ void padWithZeroesTo(vector<uchar> *content, size_t len, vector<uchar> *full_con
         }
         full_content->insert(full_content->end(), content->begin()+old_size, content->end());
     }
+}
+
+static string space = "                                                   ";
+string padLeft(string input, int width)
+{
+    int w = width-input.size();
+    if (w < 0) return input;
+    assert(w < (int)space.length());
+    return space.substr(0, w)+input;
 }
 
 int parseTime(string time) {
@@ -784,6 +930,8 @@ uint16_t crc16_EN13757(uchar *data, size_t len)
 {
     uint16_t crc = 0x0000;
 
+    assert(len == 0 || data != NULL);
+    assert(len < 1024);
     for (size_t i=0; i<len; ++i) {
         crc = crc16_EN13757_per_byte(crc, data[i]);
     }
@@ -846,6 +994,48 @@ bool listFiles(string dir, vector<string> *files)
     closedir(dp);
 
     return true;
+}
+
+int loadFile(string file, vector<string> *lines)
+{
+    char block[32768+1];
+    vector<uchar> buf;
+
+    int fd = open(file.c_str(), O_RDONLY);
+    if (fd == -1) {
+        return -1;
+    }
+    while (true) {
+        ssize_t n = read(fd, block, sizeof(block));
+        if (n == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error("Could not read file %s errno=%d\n", file.c_str(), errno);
+            close(fd);
+            return -1;
+        }
+        buf.insert(buf.end(), block, block+n);
+        if (n < (ssize_t)sizeof(block)) {
+            break;
+        }
+    }
+    close(fd);
+
+    bool eof, err;
+    auto i = buf.begin();
+    for (;;) {
+        string line = eatTo(buf, i, '\n', 32768, &eof, &err);
+        if (err) {
+            error("Error parsing simulation file.\n");
+        }
+        if (line.length() > 0) {
+            lines->push_back(line);
+        }
+        if (eof) break;
+    }
+
+    return 0;
 }
 
 bool loadFile(string file, vector<char> *buf)
@@ -951,6 +1141,13 @@ string strdatetime(struct tm *datetime)
     return string(buf);
 }
 
+string strdatetimesec(struct tm *datetime)
+{
+    char buf[256];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", datetime);
+    return string(buf);
+}
+
 AccessCheck checkIfExistsAndSameGroup(string device)
 {
     struct stat sb;
@@ -977,7 +1174,7 @@ AccessCheck checkIfExistsAndSameGroup(string device)
 
     for (int i=0; i<ngroups; ++i) {
         if (groups[i] == g->gr_gid) {
-            return AccessCheck::OK;
+            return AccessCheck::AccessOK;
         }
     }
 
@@ -1067,4 +1264,358 @@ string currentMicros()
 
     strftime(datetime, 20, "%Y-%m-%d_%H:%M:%S", localtime(&tv.tv_sec));
     return string(datetime)+"."+to_string(tv.tv_usec);
+}
+
+bool hasBytes(int n, vector<uchar>::iterator &pos, vector<uchar> &frame)
+{
+    int remaining = distance(pos, frame.end());
+    if (remaining < n) return false;
+    return true;
+}
+
+bool startsWith(string s, std::vector<uchar> &data)
+{
+    if (s.length() > data.size()) return false;
+
+    for (size_t i=0; i<s.length(); ++i)
+    {
+        if (s[i] != data[i]) return false;
+    }
+    return true;
+}
+
+struct TimePeriod
+{
+    int day_in_week_from {}; // 0 = mon 6 = sun
+    int day_in_week_to {}; // 0 = mon 6 = sun
+    int hour_from {}; // Greater than or equal.
+    int hour_to {}; // Less than.
+};
+
+bool is_inside(struct tm *nowt, TimePeriod *tp)
+{
+    int day = nowt->tm_wday-1; // tm_wday 0=sun
+    if (day == -1) day = 6;    // adjust so 0=mon and 6=sun
+    int hour = nowt->tm_hour;  // hours since midnight 0-23
+
+    // Test is inclusive. mon-sun(00-23) will cover whole week all hours.
+    // mon-tue(00-00) will cover mon and tue one hour after midnight.
+    if (day >= tp->day_in_week_from && day <= tp->day_in_week_to && hour >= tp->hour_from && hour <= tp->hour_to)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool extract_times(const char *p, TimePeriod *tp)
+{
+    if (strlen(p) != 7) return false; // Expect (00-23)
+    if (p[3] != '-') return false; // Must have - in middle.
+    int fa = p[1]-48;
+    if (fa < 0 || fa > 9) return false;
+    int fb = p[2]-48;
+    if (fb < 0 || fb > 9) return false;
+    int ta = p[4]-48;
+    if (ta < 0 || ta > 9) return false;
+    int tb = p[5]-48;
+    if (tb < 0 || tb > 9) return false;
+    tp->hour_from = fa*10+fb;
+    tp->hour_to = ta*10+tb;
+    if (tp->hour_from > 23) return false; // Hours are 00-23
+    if (tp->hour_to > 23) return false;   // Ditto.
+    if (tp->hour_to < tp->hour_from) return false; // To must be strictly larger than from, hence the need for 23.
+
+    return true;
+}
+
+int day_name_to_nr(const string& name)
+{
+    if (name == "mon") return 0;
+    if (name == "tue") return 1;
+    if (name == "wed") return 2;
+    if (name == "thu") return 3;
+    if (name == "fri") return 4;
+    if (name == "say") return 5;
+    if (name == "sun") return 6;
+    return -1;
+}
+
+bool extract_days(char *p, TimePeriod *tp)
+{
+    if (strlen(p) == 3)
+    {
+        string s = p;
+        int d = day_name_to_nr(s);
+        if (d == -1) return false;
+        tp->day_in_week_from = d;
+        tp->day_in_week_to = d;
+        return true;
+    }
+
+    if (strlen(p) != 7) return false; // Expect mon-fri
+    if (p[3] != '-') return false; // Must have - in middle.
+    string from = string(p, p+3);
+    string to = string(p+4, p+7);
+
+    int f = day_name_to_nr(from);
+    int t = day_name_to_nr(to);
+    if (f == -1 || t == -1) return false;
+    if (f >= t) return false;
+    tp->day_in_week_from = f;
+    tp->day_in_week_to = t;
+    return true;
+}
+
+bool extract_single_period(char *tok, TimePeriod *tp)
+{
+    // Minimum length is 8 chars, eg "1(00-23)"
+    size_t len = strlen(tok);
+    if (len < 8) return false;
+    // tok is for example: mon-fri(00-23) or tue(18-19) or 1(00-23)
+    char *p = strchr(tok, '(');
+    if (p == NULL) return false; // There must be a (
+    if (tok[len-1] != ')') return false; // Must end in )
+    bool ok = extract_times(p, tp);
+    if (!ok) return false;
+    *p = 0; // Terminate in the middle of tok.
+    ok = extract_days(tok, tp);
+    if (!ok) return false;
+
+    return true;
+}
+
+bool extract_periods(string periods, vector<TimePeriod> *period_structs)
+{
+    if (periods.length() == 0) return false;
+
+    char buf[periods.length()+1];
+    strcpy(buf, periods.c_str());
+
+    char *saveptr {};
+    char *tok = strtok_r(buf, ",", &saveptr);
+    if (tok == NULL)
+    {
+        // No comma found.
+        TimePeriod tp {};
+        bool ok = extract_single_period(tok, &tp);
+        if (!ok) return false;
+        period_structs->push_back(tp);
+        return true;
+    }
+
+    while (tok != NULL)
+    {
+        TimePeriod tp {};
+        bool ok = extract_single_period(tok, &tp);
+        if (!ok) return false;
+        period_structs->push_back(tp);
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
+
+    return true;
+}
+
+bool isValidTimePeriod(std::string periods)
+{
+    vector<TimePeriod> period_structs;
+    bool ok = extract_periods(periods, &period_structs);
+    return ok;
+}
+
+bool isInsideTimePeriod(time_t now, std::string periods)
+{
+    struct tm nowt {};
+    localtime_r(&now, &nowt);
+
+    vector<TimePeriod> period_structs;
+
+    bool ok = extract_periods(periods, &period_structs);
+    if (!ok) return false;
+
+    for (auto &tp : period_structs)
+    {
+        //debug("period %d %d %d %d\n", tp.day_in_week_from, tp.day_in_week_to, tp.hour_from, tp.hour_to);
+        if (is_inside(&nowt, &tp)) return true;
+    }
+    return false;
+}
+
+size_t memoryUsage()
+{
+    return 0;
+}
+
+vector<string> alarm_shells_;
+
+const char* toString(Alarm type)
+{
+    switch (type)
+    {
+    case Alarm::DeviceFailure: return "DeviceFailure";
+    case Alarm::RegularResetFailure: return "RegularResetFailure";
+    case Alarm::DeviceInactivity: return "DeviceInactivity";
+    case Alarm::SpecifiedDeviceNotFound: return "SpecifiedDeviceNotFound";
+    }
+    return "?";
+}
+
+void logAlarm(Alarm type, string info)
+{
+    vector<string> envs;
+    string ts = toString(type);
+    envs.push_back("ALARM_TYPE="+ts);
+
+    string msg = tostrprintf("[ALARM %s] %s", ts.c_str(), info.c_str());
+    envs.push_back("ALARM_MESSAGE="+msg);
+
+    warning("%s\n", msg.c_str());
+
+    for (auto &s : alarm_shells_)
+    {
+        vector<string> args;
+        args.push_back("-c");
+        args.push_back(s);
+        invokeShell("/bin/sh", args, envs);
+    }
+}
+
+void setAlarmShells(vector<string> &alarm_shells)
+{
+    alarm_shells_ = alarm_shells;
+}
+
+bool stringFoundCaseIgnored(string haystack, string needle)
+{
+    // Modify haystack and needle, in place, to become lowercase.
+    std::for_each(haystack.begin(), haystack.end(), [](char & c) {
+        c = ::tolower(c);
+    });
+    std::for_each(needle.begin(), needle.end(), [](char & c) {
+        c = ::tolower(c);
+    });
+
+    // Now use default c++ find, return true if needle was found in haystack.
+    return haystack.find(needle) != string::npos;
+}
+
+vector<string> splitString(string &s, char c)
+{
+    auto end = s.cend();
+    auto start = end;
+
+    std::vector<std::string> v;
+    for (auto i = s.cbegin(); i != end; ++i)
+    {
+        if (*i != c)
+        {
+            if (start == end)
+            {
+                start = i;
+            }
+            continue;
+        }
+        if (start != end)
+        {
+            v.emplace_back(start, i);
+            start = end;
+        }
+    }
+    if (start != end)
+    {
+        v.emplace_back(start, end);
+    }
+    return v;
+}
+
+uint32_t indexFromRtlSdrName(string &s)
+{
+    size_t p = s.find('_');
+    if (p == string::npos) return -1;
+    string n = s.substr(0, p);
+    return (uint32_t)atoi(n.c_str());
+}
+
+#define KB 1024ull
+
+string helper(size_t scale, size_t s, string suffix)
+{
+    size_t o = s;
+    s /= scale;
+    size_t diff = o-(s*scale);
+    if (diff == 0) {
+        return to_string(s) + ".00"+suffix;
+    }
+    size_t dec = (int)(100*(diff+1) / scale);
+    return to_string(s) + ((dec<10)?".0":".") + to_string(dec) + suffix;
+}
+
+string humanReadableTwoDecimals(size_t s)
+{
+    if (s < KB)
+    {
+        return to_string(s) + " B";
+    }
+    if (s < KB * KB)
+    {
+        return helper(KB, s, " KiB");
+    }
+    if (s < KB * KB * KB)
+    {
+        return helper(KB*KB, s, " MiB");
+    }
+#if SIZEOF_SIZE_T == 8
+    if (s < KB * KB * KB * KB)
+    {
+        return helper(KB*KB*KB, s, " GiB");
+    }
+    if (s < KB * KB * KB * KB * KB)
+    {
+        return helper(KB*KB*KB*KB, s, " TiB");
+    }
+    return helper(KB*KB*KB*KB*KB, s, " PiB");
+#else
+    return helper(KB*KB*KB, s, " GiB");
+#endif
+}
+
+bool check_if_rtlwmbus_exists_in_path()
+{
+    bool found = false;
+    vector<string> args;
+    args.push_back("-c");
+    args.push_back("rtl_wmbus < /dev/null");
+    vector<string> envs;
+    string out;
+    int rc = invokeShellCaptureOutput("/bin/sh", args, envs, &out, true);
+    if (rc == 2 && out.find("rtl_wmbus") == string::npos)
+    {
+        debug("(main) rtl_wmbus found in path\n");
+        found = true;
+    }
+    else
+    {
+        debug("(main) rtl_wmbus NOT found in path\n");
+    }
+    return found;
+}
+
+bool check_if_rtlsdr_exists_in_path()
+{
+    bool found = false;
+    vector<string> args;
+    args.push_back("-c");
+    args.push_back("rtl_sdr < /dev/null");
+    vector<string> envs;
+    string out;
+    invokeShellCaptureOutput("/bin/sh", args, envs, &out, true);
+    if (out.find("RTL2832") != string::npos)
+    {
+        debug("(main) rtl_srd found in path\n");
+        found = true;
+    }
+    else
+    {
+        debug("(main) rtl_sdr NOT found in path\n");
+    }
+    return found;
 }

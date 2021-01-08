@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2018-2019 Fredrik Öhrström
+ Copyright (C) 2018-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -20,27 +20,29 @@
 #include"util.h"
 #include"wmbus.h"
 
+#include<assert.h>
 #include<memory.h>
 
-void decryptMode1_AES_CTR(Telegram *t, vector<uchar> &aeskey)
+bool decrypt_ELL_AES_CTR(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey)
 {
-    vector<uchar> content;
-    content.insert(content.end(), t->payload.begin(), t->payload.end());
-    debugPayload("(Mode1) decrypting", content);
+    if (aeskey.size() == 0) return true;
 
-    size_t remaining = content.size();
-    if (remaining > 16) remaining = 16;
+    vector<uchar> encrypted_bytes;
+    vector<uchar> decrypted_bytes;
+    encrypted_bytes.insert(encrypted_bytes.end(), pos, frame.end());
+    frame.erase(pos, frame.end());
+    debugPayload("(ELL) decrypting", encrypted_bytes);
 
     uchar iv[16];
     int i=0;
     // M-field
-    iv[i++] = t->m_field&255; iv[i++] = t->m_field>>8;
+    iv[i++] = t->dll_mfct_b[0]; iv[i++] = t->dll_mfct_b[1];
     // A-field
-    for (int j=0; j<6; ++j) { iv[i++] = t->a_field[j]; }
+    for (int j=0; j<6; ++j) { iv[i++] = t->dll_a[j]; }
     // CC-field
-    iv[i++] = t->cc_field;
+    iv[i++] = t->ell_cc;
     // SN-field
-    for (int j=0; j<4; ++j) { iv[i++] = t->sn[j]; }
+    for (int j=0; j<4; ++j) { iv[i++] = t->ell_sn_b[j]; }
     // FN
     iv[i++] = 0; iv[i++] = 0;
     // BC
@@ -48,39 +50,40 @@ void decryptMode1_AES_CTR(Telegram *t, vector<uchar> &aeskey)
 
     vector<uchar> ivv(iv, iv+16);
     string s = bin2hex(ivv);
-    debug("(Mode1) IV %s\n", s.c_str());
+    debug("(ELL) IV %s\n", s.c_str());
 
-    uchar xordata[16];
-    AES_ECB_encrypt(iv, &aeskey[0], xordata, 16);
+    int block = 0;
+    for (size_t offset = 0; offset < encrypted_bytes.size(); offset += 16)
+    {
+        size_t block_size = 16;
+        if (offset + block_size > encrypted_bytes.size())
+        {
+            block_size = encrypted_bytes.size() - offset;
+        }
 
-    uchar decrypt[16];
-    xorit(xordata, &content[0], decrypt, remaining);
+        assert(block_size > 0 && block_size <= 16);
 
-    vector<uchar> dec(decrypt, decrypt+remaining);
-    debugPayload("(Mode1) decrypted first block", dec);
-
-    if (content.size() > 16) {
-        remaining = content.size()-16;
-        if (remaining > 16) remaining = 16; // Should not happen.
-
-        incrementIV(iv, sizeof(iv));
-        vector<uchar> ivv2(iv, iv+16);
-        string s2 = bin2hex(ivv2);
-        debug("(Mode1) IV+1 %s\n", s2.c_str());
-
+        // Generate the pseudo-random bits from the IV and the key.
+        uchar xordata[16];
         AES_ECB_encrypt(iv, &aeskey[0], xordata, 16);
 
-        xorit(xordata, &content[16], decrypt, remaining);
+        // Xor the data with the pseudo-random bits to decrypt into tmp.
+        uchar tmp[block_size];
+        xorit(xordata, &encrypted_bytes[offset], tmp, block_size);
 
-        vector<uchar> dec2(decrypt, decrypt+remaining);
-        debugPayload("(Mode1) decrypted second block", dec2);
+        debug("(ELL) block %d block_size %d offset %zu\n", block, block_size, offset);
+        block++;
 
-        // Append the second decrypted block to the first.
-        dec.insert(dec.end(), dec2.begin(), dec2.end());
+        vector<uchar> tmpv(tmp, tmp+block_size);
+        debugPayload("(ELL) decrypted", tmpv);
+
+        decrypted_bytes.insert(decrypted_bytes.end(), tmpv.begin(), tmpv.end());
+
+        incrementIV(iv, sizeof(iv));
     }
-    t->content.clear();
-    t->content.insert(t->content.end(), dec.begin(), dec.end());
-    debugPayload("(Mode1) decrypted", t->content);
+    debugPayload("(ELL) decrypted", decrypted_bytes);
+    frame.insert(frame.end(), decrypted_bytes.begin(), decrypted_bytes.end());
+    return true;
 }
 
 string frameTypeKamstrupC1(int ft) {
@@ -89,47 +92,113 @@ string frameTypeKamstrupC1(int ft) {
     return "?";
 }
 
-void decryptMode5_AES_CBC(Telegram *t, vector<uchar> &aeskey)
+bool decrypt_TPL_AES_CBC_IV(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey)
 {
-    vector<uchar> content;
-    content.insert(content.end(), t->payload.begin(), t->payload.end());
-    debugPayload("(Mode5) decrypting", content);
+    if (aeskey.size() == 0) return true;
+
+    vector<uchar> buffer;
+    buffer.insert(buffer.end(), pos, frame.end());
+    frame.erase(pos, frame.end());
+    debugPayload("(TPL) decrypting", buffer);
+
+    size_t len = buffer.size();
+
+    if (t->tpl_num_encr_blocks)
+    {
+        len = t->tpl_num_encr_blocks*16;
+    }
+
+    debug("(TPL) num encrypted blocks %d (%d bytes and remaining unencrypted %d bytes)\n",
+          t->tpl_num_encr_blocks, len, buffer.size()-len);
 
     // The content should be a multiple of 16 since we are using AES CBC mode.
-    if (content.size() % 16 != 0)
+    if (len % 16 != 0)
     {
-        warning("(Mode5) warning: decryption received non-multiple of 16 bytes! "
+        warning("(TPL) warning: decryption received non-multiple of 16 bytes! "
                 "Got %zu bytes shrinking message to %zu bytes.\n",
-                content.size(), content.size() - content.size() % 16);
-        while (content.size() % 16 != 0)
-        {
-            content.pop_back();
-        }
+                len, len - len % 16);
+        len -= len % 16;
+        assert (len % 16 == 0);
     }
 
     uchar iv[16];
     int i=0;
     // M-field
-    iv[i++] = t->m_field&255; iv[i++] = t->m_field>>8;
+    iv[i++] = t->dll_mfct_b[0]; iv[i++] = t->dll_mfct_b[1];
     // A-field
-    for (int j=0; j<6; ++j) { iv[i++] = t->a_field[j]; }
+    for (int j=0; j<6; ++j) { iv[i++] = t->dll_a[j]; }
     // ACC
-    for (int j=0; j<8; ++j) { iv[i++] = t->acc; }
+    for (int j=0; j<8; ++j) { iv[i++] = t->tpl_acc; }
 
     vector<uchar> ivv(iv, iv+16);
     string s = bin2hex(ivv);
-    debug("(Mode5) IV %s\n", s.c_str());
+    debug("(TPL) IV %s\n", s.c_str());
 
-    uchar content_data[content.size()];
-    memcpy(content_data, &content[0], content.size());
-    uchar decrypted_data[content.size()];
-    AES_CBC_decrypt_buffer(decrypted_data, content_data, content.size(), &aeskey[0], iv);
+    uchar buffer_data[buffer.size()];
+    memcpy(buffer_data, &buffer[0], buffer.size());
+    uchar decrypted_data[buffer.size()];
+    AES_CBC_decrypt_buffer(decrypted_data, buffer_data, len, &aeskey[0], iv);
 
-    if (decrypted_data[0] != 0x2F || decrypted_data[1] != 0x2F) {
-        warning("(Mode5) warning: telegram payload does not start with 2F2F (did you use the correct encryption key?)\n");
+    frame.insert(frame.end(), decrypted_data, decrypted_data+len);
+    debugPayload("(TPL) decrypted ", frame, pos);
+
+    if (len < buffer.size())
+    {
+        frame.insert(frame.end(), buffer_data+len, buffer_data+buffer.size());
+        debugPayload("(TPL) appended  ", frame, pos);
+    }
+    return true;
+}
+
+bool decrypt_TPL_AES_CBC_NO_IV(Telegram *t, vector<uchar> &frame, vector<uchar>::iterator &pos, vector<uchar> &aeskey)
+{
+    if (aeskey.size() == 0) return true;
+
+    vector<uchar> buffer;
+    buffer.insert(buffer.end(), pos, frame.end());
+    frame.erase(pos, frame.end());
+    debugPayload("(TPL) decrypting", buffer);
+
+    size_t len = buffer.size();
+
+    if (t->tpl_num_encr_blocks)
+    {
+        len = t->tpl_num_encr_blocks*16;
     }
 
-    t->content.clear();
-    t->content.insert(t->content.end(), decrypted_data, decrypted_data+content.size());
-    debugPayload("(Mode5) decrypted", t->content);
+    debug("(TPL) num encrypted blocks %d (%d bytes and remaining unencrypted %d bytes)\n",
+          t->tpl_num_encr_blocks, len, buffer.size()-len);
+
+    // The content should be a multiple of 16 since we are using AES CBC mode.
+    if (len % 16 != 0)
+    {
+        warning("(TPL) warning: decryption received non-multiple of 16 bytes! "
+                "Got %zu bytes shrinking message to %zu bytes.\n",
+                len, len - len % 16);
+        len -= len % 16;
+        assert (len % 16 == 0);
+    }
+
+    uchar iv[16];
+    memset(iv, 0, sizeof(iv));
+
+    vector<uchar> ivv(iv, iv+16);
+    string s = bin2hex(ivv);
+    debug("(TPL) IV %s\n", s.c_str());
+
+    uchar buffer_data[buffer.size()];
+    memcpy(buffer_data, &buffer[0], buffer.size());
+    uchar decrypted_data[buffer.size()];
+    AES_CBC_decrypt_buffer(decrypted_data, buffer_data, buffer.size(), &aeskey[0], iv);
+
+    frame.insert(frame.end(), decrypted_data, decrypted_data+buffer.size());
+    debugPayload("(TPL) decrypted ", frame, pos);
+
+    if (len < buffer.size())
+    {
+        frame.insert(frame.end(), buffer_data+len, buffer_data+buffer.size());
+        debugPayload("(TPL) appended  ", frame, pos);
+    }
+
+    return true;
 }

@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2019 Fredrik Öhrström
+ Copyright (C) 2019-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -26,7 +26,7 @@ using namespace std;
 
 struct MKRadio3 : public virtual WaterMeter, public virtual MeterCommonImplementation
 {
-    MKRadio3(WMBus *bus, MeterInfo &mi);
+    MKRadio3(MeterInfo &mi);
 
     double totalWaterConsumption(Unit u);
     bool  hasTotalWaterConsumption();
@@ -40,17 +40,12 @@ private:
     double target_water_consumption_m3_ {};
 };
 
-MKRadio3::MKRadio3(WMBus *bus, MeterInfo &mi) :
-    MeterCommonImplementation(bus, mi, MeterType::MKRADIO3, MANUFACTURER_TCH)
+MKRadio3::MKRadio3(MeterInfo &mi) :
+    MeterCommonImplementation(mi, MeterType::MKRADIO3)
 {
-    setEncryptionMode(EncryptionMode::None);
-
-    addMedia(0x62);
-    addMedia(0x72);
+    setExpectedTPLSecurityMode(TPLSecurityMode::AES_CBC_IV);
 
     addLinkMode(LinkMode::T1);
-
-    setExpectedVersion(0x74);
 
     addPrint("total", Quantity::Volume,
              [&](Unit u){ return totalWaterConsumption(u); },
@@ -61,26 +56,26 @@ MKRadio3::MKRadio3(WMBus *bus, MeterInfo &mi) :
              [&](Unit u){ return targetWaterConsumption(u); },
              "The total water consumption recorded at the beginning of this month.",
              true, true);
-
-    MeterCommonImplementation::bus()->onTelegram(calll(this,handleTelegram,Telegram*));
 }
 
-unique_ptr<WaterMeter> createMKRadio3(WMBus *bus, MeterInfo &mi)
+shared_ptr<WaterMeter> createMKRadio3(MeterInfo &mi)
 {
-    return unique_ptr<WaterMeter>(new MKRadio3(bus, mi));
+    return shared_ptr<WaterMeter>(new MKRadio3(mi));
 }
 
 void MKRadio3::processContent(Telegram *t)
 {
-    // Meter record:
-    map<string,pair<int,DVEntry>> vendor_values;
-
     // Unfortunately, the MK Radio 3 is mostly a proprieatary protocol
     // simple wrapped inside a wmbus telegram since the ci-field is 0xa2.
     // Which means that the entire payload is manufacturer specific.
 
-    uchar prev_lo = t->content[3];
-    uchar prev_hi = t->content[4];
+    map<string,pair<int,DVEntry>> vendor_values;
+    vector<uchar> content;
+
+    t->extractPayload(&content);
+
+    uchar prev_lo = content[3];
+    uchar prev_hi = content[4];
     double prev = (256.0*prev_hi+prev_lo)/10.0;
 
     string prevs;
@@ -90,8 +85,8 @@ void MKRadio3::processContent(Telegram *t)
     t->explanations.push_back({ offset, prevs });
     t->addMoreExplanation(offset, " prev consumption (%f m3)", prev);
 
-    uchar curr_lo = t->content[7];
-    uchar curr_hi = t->content[8];
+    uchar curr_lo = content[7];
+    uchar curr_hi = content[8];
     double curr = (256.0*curr_hi+curr_lo)/10.0;
 
     string currs;

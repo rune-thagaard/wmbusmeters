@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -16,7 +16,6 @@
 */
 
 #include"cmdline.h"
-#include"config.h"
 #include"meters.h"
 #include"util.h"
 
@@ -24,7 +23,7 @@
 
 using namespace std;
 
-unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
+shared_ptr<Configuration> parseCommandLine(int argc, char **argv) {
 
     Configuration * c = new Configuration;
 
@@ -35,25 +34,54 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
     } else {
         filename = argv[0];
     }
-    if (!strcmp(filename, "wmbusmetersd")) {
+    if (!strcmp(filename, "wmbusmetersd"))
+    {
         c->daemon = true;
-        if (argc != 2) {
-            error("Usage error: wmbusmetersd must have a single argument to the pid file.\n");
+        if (argc < 2) {
+            error("Usage error: wmbusmetersd must have at least a single argument to the pid file.\n"
+                  "But you can also supply --device= and --listento= to override the config files.\n");
         }
-        c->pid_file = argv[1];
-        return unique_ptr<Configuration>(c);
+        int i = 1;
+        bool pid_file_found = false;
+        for (;;)
+        {
+            if (argv[i] == NULL) break;
+            if (!strncmp(argv[i], "--device=", 9))
+            {
+                c->device_override = string(argv[i]+9);
+                debug("(daemon) device override \"%s\"\n", c->device_override.c_str());
+                i++;
+                continue;
+            }
+            if (!strncmp(argv[i], "--listento=", 11))
+            {
+                c->listento_override = string(argv[i]+11);
+                debug("(daemon) listento override \"%s\"\n", c->listento_override.c_str());
+                i++;
+                continue;
+            }
+            c->pid_file = argv[i];
+            pid_file_found = true;
+            break;
+        }
+        if (!pid_file_found)
+        {
+            error("Usage error: you must supply the pid file as the argument to wmbusmetersd.\n");
+        }
+        return shared_ptr<Configuration>(c);
     }
     if (argc < 2) {
         c->need_help = true;
-        return unique_ptr<Configuration>(c);
+        return shared_ptr<Configuration>(c);
     }
-    while (argv[i] && argv[i][0] == '-') {
+    while (argv[i] && argv[i][0] == '-')
+    {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "-help") || !strcmp(argv[i], "--help")) {
             c->need_help = true;
-            return unique_ptr<Configuration>(c);
+            return shared_ptr<Configuration>(c);
         }
-        if (!strcmp(argv[i], "--silence")) {
-            c->silence = true;
+        if (!strcmp(argv[i], "--silent")) {
+            c->silent = true;
             i++;
             continue;
         }
@@ -64,38 +92,59 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--version")) {
             c->version = true;
-            return unique_ptr<Configuration>(c);
+            return shared_ptr<Configuration>(c);
         }
         if (!strcmp(argv[i], "--license")) {
             c->license = true;
-            return unique_ptr<Configuration>(c);
+            return shared_ptr<Configuration>(c);
         }
         if (!strcmp(argv[i], "--debug")) {
             c->debug = true;
             i++;
             continue;
         }
-        if (!strncmp(argv[i], "--listento=", 11)) {
+        if (!strcmp(argv[i], "--trace")) {
+            c->debug = true;
+            c->trace = true;
+            i++;
+            continue;
+        }
+        if (!strcmp(argv[i], "--internaltesting")) {
+            c->internaltesting = true;
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--donotprobe=", 13))
+        {
+            string df = string(argv[i]+13);
+            debug("(cmdline) do not probe \"%s\"\n", df.c_str());
+            c->do_not_probe_ttys.insert(df);
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--listento=", 11))
+        {
             LinkModeSet lms = parseLinkModes(argv[i]+11);
-            if (lms.bits() == 0) {
-                error("Unknown link mode \"%s\"!\n", argv[i]+11);
+            if (lms.empty())
+            {
+                error("Unknown default link mode \"%s\"!\n", argv[i]+11);
             }
-            if (c->link_mode_configured) {
-                error("You have already specified a link mode!\n");
+            if (!c->default_device_linkmodes.empty()) {
+                error("You have already specified a default link mode!\n");
             }
-            c->listen_to_link_modes = lms;
-            c->link_mode_configured = true;
+            c->default_device_linkmodes = lms;
             i++;
             continue;
         }
 
         LinkMode lm = isLinkModeOption(argv[i]);
         if (lm != LinkMode::UNKNOWN) {
-            if (c->link_mode_configured) {
-                error("You have already specified a link mode!\n");
+            if (!c->default_device_linkmodes.empty())
+            {
+                error("You have already specified a default link mode!\n");
             }
-            c->listen_to_link_modes.addLinkMode(lm);
-            c->link_mode_configured = true;
+            // Add to the empty set.
+            c->default_device_linkmodes.addLinkMode(lm);
             i++;
             continue;
         }
@@ -109,7 +158,7 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             {
                 c->useconfig = true;
                 c->config_root = "";
-                return unique_ptr<Configuration>(c);
+                return shared_ptr<Configuration>(c);
             }
             else if (strlen(argv[i]) > 12 && argv[i][11] == '=')
             {
@@ -119,16 +168,35 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
                 if (c->config_root == "/") {
                     c->config_root = "";
                 }
-                return unique_ptr<Configuration>(c);
             }
             else
             {
                 error("You must supply a directory to --useconfig=dir\n");
             }
             i++;
-            if (i > 1 || argc > 2) {
-                error("Usage error: --useconfig implies no other arguments on the command line.\n");
+            for (;;)
+            {
+                if (argv[i] == NULL) break;
+                if (!strncmp(argv[i], "--device=", 9))
+                {
+                    c->device_override = string(argv[i]+9);
+                    debug("(useconfig) device override \"%s\"\n", c->device_override.c_str());
+                    i++;
+                    continue;
+                }
+                if (!strncmp(argv[i], "--listento=", 11))
+                {
+                    c->listento_override = string(argv[i]+11);
+                    debug("(useconfig) listento override \"%s\"\n", c->listento_override.c_str());
+                    i++;
+                    continue;
+                }
+                break;
             }
+            if (i+1 < argc) {
+                error("Usage error: --useconfig can only be followed by --device= and --listento=\n");
+            }
+            return shared_ptr<Configuration>(c);
             continue;
         }
         if (!strcmp(argv[i], "--reload")) {
@@ -136,24 +204,32 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             if (i > 1 || argc > 2) {
                 error("Usage error: --reload implies no other arguments on the command line.\n");
             }
-            return unique_ptr<Configuration>(c);
+            return shared_ptr<Configuration>(c);
         }
-        if (!strncmp(argv[i], "--format", 8)) {
-            if (strlen(argv[i]) == 8 ||
-                (strlen(argv[i]) == 13 &&
-                 !strncmp(argv[i]+8, "=json", 5)))
+        if (!strncmp(argv[i], "--format=", 9))
+        {
+            if (!strcmp(argv[i]+9, "json"))
             {
                 c->json = true;
                 c->fields = false;
             }
-            else if (strlen(argv[i]) == 15 &&
-                     !strncmp(argv[i]+7, "=fields", 7))
+            else
+            if (!strcmp(argv[i]+9, "fields"))
             {
                 c->json = false;
                 c->fields = true;
                 c->separator = ';';
-            } else {
-                error("Unknown output format: \"%s\"\n", argv[i]+8);
+            }
+            else
+            if (!strcmp(argv[i]+9, "hr"))
+            {
+                c->json = false;
+                c->fields = false;
+                c->separator = '\t';
+            }
+            else
+            {
+                error("Unknown output format: \"%s\"\n", argv[i]+9);
             }
             i++;
             continue;
@@ -169,6 +245,18 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
+        if (!strncmp(argv[i], "--selectfields=", 15)) {
+            if (strlen(argv[i]) > 15)
+            {
+                string s = string(argv[i]+15);
+                handleSelectedFields(c, s);
+            } else {
+                error("You must supply fields to be selected.\n");
+            }
+            i++;
+            continue;
+        }
+
         if (!strncmp(argv[i], "--separator=", 12)) {
             if (!c->fields) {
                 error("You must specify --format=fields before --separator=X\n");
@@ -280,12 +368,36 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
+        if (!strncmp(argv[i], "--usestderr", 11)) {
+            c->use_stderr_for_log = true;
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--ignoreduplicates", 18)) {
+            c->ignore_duplicate_telegrams = true;
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--usestdoutforlogging", 13)) {
+            c->use_stderr_for_log = false;
+            i++;
+            continue;
+        }
         if (!strncmp(argv[i], "--shell=", 8)) {
             string cmd = string(argv[i]+8);
             if (cmd == "") {
-                error("The shell command cannot be empty.\n");
+                error("The telegram shell command cannot be empty.\n");
             }
-            c->shells.push_back(cmd);
+            c->telegram_shells.push_back(cmd);
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--alarmshell=", 13)) {
+            string cmd = string(argv[i]+13);
+            if (cmd == "") {
+                error("The alarm shell command cannot be empty.\n");
+            }
+            c->alarm_shells.push_back(cmd);
             i++;
             continue;
         }
@@ -302,8 +414,27 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
-        if (!strncmp(argv[i], "--shellenvs", 11)) {
+        if (!strncmp(argv[i], "--listenvs=", 11)) {
             c->list_shell_envs = true;
+            c->list_meter = string(argv[i]+11);
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--listfields=", 13)) {
+            c->list_fields = true;
+            c->list_meter = string(argv[i]+13);
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--listmeters=", 13)) {
+            c->list_meters = true;
+            c->list_meters_search = string(argv[i]+13);
+            i++;
+            continue;
+        }
+        else if (!strncmp(argv[i], "--listmeters", 12)) {
+            c->list_meters = true;
+            c->list_meters_search = "";
             i++;
             continue;
         }
@@ -320,14 +451,38 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
             i++;
             continue;
         }
-        if (!strncmp(argv[i], "--reopenafter=", 12) && strlen(argv[i]) > 14) {
-            c->reopenafter = parseTime(argv[i]+14);
-            if (c->reopenafter <= 0) {
-                error("Not a valid time to reopen after. \"%s\"\n", argv[i]+14);
+        if (!strcmp(argv[i], "--nodeviceexit")) {
+            c->nodeviceexit = true;
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--resetafter=", 13) && strlen(argv[i]) > 13) {
+            c->resetafter = parseTime(argv[i]+13);
+            if (c->resetafter <= 0) {
+                error("Not a valid time to regularly reset after. \"%s\"\n", argv[i]+13);
             }
             i++;
             continue;
         }
+        if (!strncmp(argv[i], "--alarmtimeout=", 15)) {
+            c->alarm_timeout = parseTime(argv[i]+15);
+            if (c->alarm_timeout <= 0) {
+                error("Not a valid alarm timeout. \"%s\"\n", argv[i]+15);
+            }
+            i++;
+            continue;
+        }
+        if (!strncmp(argv[i], "--alarmexpectedactivity=", 24)) {
+            string ea = string(argv[i]+24);
+            if (!isValidTimePeriod(ea))
+            {
+                error("Not a valid time period string. \"%s\"\n", ea.c_str());
+            }
+            c->alarm_expected_activity = ea;
+            i++;
+            continue;
+        }
+
         if (!strcmp(argv[i], "--")) {
             i++;
             break;
@@ -335,18 +490,31 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
         error("Unknown option \"%s\"\n", argv[i]);
     }
 
-    char *extra = argv[i] ? strchr(argv[i], ':') : NULL ;
-    if (extra) {
-        *extra = 0;
-        extra++;
-        c->device_extra = extra;
+    while (argv[i])
+    {
+        bool ok = handleDevice(c, argv[i]);
+        if (!ok)
+        {
+            if (!argv[i+1])
+            {
+                // This was the last argument on the commandline.
+                // It should have been a device or a file.
+                error("Not a valid device \"%s\"\n", argv[i]);
+            }
+            // There are more arguments...
+            break;
+        }
+        i++;
     }
-    if (argv[i]) {
-        c->device = argv[i];
-    }
-    i++;
-    if (c->device.length() == 0) {
-        error("You must supply the usb device to which the wmbus dongle is connected.\n");
+
+
+    if (c->supplied_wmbus_devices.size() == 0 &&
+        c->use_auto_device_detect == false &&
+        !c->list_shell_envs &&
+        !c->list_fields &&
+        !c->list_meters)
+    {
+        error("You must supply at least one device (eg auto:c1) to receive wmbus telegrams.\n");
     }
 
     if ((argc-i) % 4 != 0) {
@@ -396,5 +564,5 @@ unique_ptr<Configuration> parseCommandLine(int argc, char **argv) {
         c->meters.push_back(MeterInfo(name, type, id, key, modes, no_meter_shells, no_meter_jsons));
     }
 
-    return unique_ptr<Configuration>(c);
+    return shared_ptr<Configuration>(c);
 }

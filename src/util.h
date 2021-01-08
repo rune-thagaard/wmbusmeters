@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -37,6 +37,9 @@ typedef unsigned char uchar;
 #define call(A,B) ([&](){A->B();})
 #define calll(A,B,T) ([&](T t){A->B(t);})
 
+uchar bcd2bin(uchar c);
+uchar revbcd2bin(uchar c);
+uchar reverse(uchar c);
 bool hex2bin(const char* src, std::vector<uchar> *target);
 bool hex2bin(std::string &src, std::vector<uchar> *target);
 bool hex2bin(std::vector<uchar> &src, std::vector<uchar> *target);
@@ -44,45 +47,72 @@ std::string bin2hex(std::vector<uchar> &target);
 std::string bin2hex(std::vector<uchar>::iterator data, std::vector<uchar>::iterator end, int len);
 std::string safeString(std::vector<uchar> &target);
 void strprintf(std::string &s, const char* fmt, ...);
+std::string tostrprintf(const char* fmt, ...);
+
 // Return for example: 2010-03-21
 std::string strdate(struct tm *date);
-// Return for example: 2010-03-21 15:22:03
+// Return for example: 2010-03-21 15:22
 std::string strdatetime(struct tm *date);
+// Return for example: 2010-03-21 15:22:03
+std::string strdatetimesec(struct tm *date);
+
+bool stringFoundCaseIgnored(std::string haystack, std::string needle);
 
 void xorit(uchar *srca, uchar *srcb, uchar *dest, int len);
+void shiftLeft(uchar *srca, uchar *srcb, int len);
 std::string format3fdot3f(double v);
 bool enableLogfile(std::string logfile, bool daemon);
 void disableLogfile();
 void enableSyslog();
 void error(const char* fmt, ...);
 void verbose(const char* fmt, ...);
+void trace(const char* fmt, ...);
 void debug(const char* fmt, ...);
 void warning(const char* fmt, ...);
 void info(const char* fmt, ...);
 void notice(const char* fmt, ...);
 
-void warningSilenced(bool b);
+void silentLogging(bool b);
 void verboseEnabled(bool b);
 void debugEnabled(bool b);
+void traceEnabled(bool b);
+void stderrEnabled(bool b);
 void logTelegramsEnabled(bool b);
+void internalTestingEnabled(bool b);
+bool isInternalTestingEnabled();
 
 bool isVerboseEnabled();
 bool isDebugEnabled();
 bool isLogTelegramsEnabled();
 
 void debugPayload(std::string intro, std::vector<uchar> &payload);
-void logTelegram(std::string intro, std::vector<uchar> &header, std::vector<uchar> &content);
+void debugPayload(std::string intro, std::vector<uchar> &payload, std::vector<uchar>::iterator &pos);
+void logTelegram(std::vector<uchar> &parsed, int header_size, int suffix_size);
+
+enum class Alarm
+{
+    DeviceFailure,
+    RegularResetFailure,
+    DeviceInactivity,
+    SpecifiedDeviceNotFound
+};
+
+const char* toString(Alarm type);
+void logAlarm(Alarm type, std::string info);
+void setAlarmShells(std::vector<std::string> &alarm_shells);
 
 bool isValidMatchExpression(std::string id, bool non_compliant);
 bool isValidMatchExpressions(std::string ids, bool non_compliant);
 bool doesIdMatchExpression(std::string id, std::string match);
 bool doesIdMatchExpressions(std::string& id, std::vector<std::string>& ids);
+bool isValidId(std::string id, bool accept_non_compliant);
 
 bool isValidKey(std::string& key, MeterType mt);
 bool isFrequency(std::string& fq);
 bool isNumber(std::string& fq);
 
 std::vector<std::string> splitMatchExpressions(std::string& mes);
+std::vector<std::string> splitString(std::string &s, char c);
 
 void incrementIV(uchar *iv, size_t len);
 
@@ -91,13 +121,23 @@ bool checkFileExists(const char *file);
 bool checkIfSimulationFile(const char *file);
 bool checkIfDirExists(const char *dir);
 bool listFiles(std::string dir, std::vector<std::string> *files);
+int loadFile(std::string file, std::vector<std::string> *lines);
 bool loadFile(std::string file, std::vector<char> *buf);
 
 std::string eatTo(std::vector<uchar> &v, std::vector<uchar>::iterator &i, int c, size_t max, bool *eof, bool *err);
 
 void padWithZeroesTo(std::vector<uchar> *content, size_t len, std::vector<uchar> *full_content);
+std::string padLeft(std::string input, int width);
 
+// Parse text string into seconds, 5h = (3600*5) 2m = (60*2) 1s = 1
 int parseTime(std::string time);
+
+// Test if current time is inside any of the specified periods.
+// For example: mon-sun(00-24) is always true!
+//              mon-fri(08-20) is true monday to friday from 08.00 to 19.59
+//              tue(09-10),sat(00-24) is true tuesday 09.00 to 09.59 and whole of saturday.
+bool isInsideTimePeriod(time_t now, std::string periods);
+bool isValidTimePeriod(std::string periods);
 
 uint16_t crc16_EN13757(uchar *data, size_t len);
 
@@ -118,7 +158,7 @@ std::string eatToSkipWhitespace(std::vector<char> &v, std::vector<char>::iterato
 void trimWhitespace(std::string *s);
 // Returns true if device exists and this programs user, belongs
 // to the same group that the device belongs to.
-enum class AccessCheck { NotThere, NotSameGroup, OK };
+enum class AccessCheck { NotThere, NotSameGroup, Locked, AccessOK };
 AccessCheck checkIfExistsAndSameGroup(std::string device);
 // Count the number of 1:s in the binary number v.
 int countSetBits(int v);
@@ -132,5 +172,21 @@ std::string currentDay();
 std::string currentHour();
 std::string currentMinute();
 std::string currentMicros();
+
+#define CHECK(n) if (!hasBytes(n, pos, frame)) return expectedMore(__LINE__);
+
+bool hasBytes(int n, std::vector<uchar>::iterator &pos, std::vector<uchar> &frame);
+
+bool startsWith(std::string s, std::vector<uchar> &data);
+
+// Sum the memory used by the heap and stack.
+size_t memoryUsage();
+
+std::string humanReadableTwoDecimals(size_t s);
+
+uint32_t indexFromRtlSdrName(std::string &s);
+
+bool check_if_rtlwmbus_exists_in_path();
+bool check_if_rtlsdr_exists_in_path();
 
 #endif

@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2018-2019 Fredrik Öhrström
+ Copyright (C) 2018-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include"aescmac.h"
 #include"cmdline.h"
 #include"config.h"
 #include"meters.h"
@@ -30,21 +31,37 @@ using namespace std;
 
 int test_crc();
 int test_dvparser();
+int test_test();
 int test_linkmodes();
 void test_ids();
+void test_kdf();
+void test_periods();
+void test_devices();
 
 int main(int argc, char **argv)
 {
     if (argc > 1) {
-        // Supply --debug (oh well, anything works) to enable debug mode.
-        debugEnabled(true);
+        if (!strcmp(argv[1], "--debug"))
+        {
+            debugEnabled(true);
+        }
+        if (!strcmp(argv[1], "--trace"))
+        {
+            debugEnabled(true);
+            traceEnabled(true);
+        }
     }
     onExit([](){});
 
     test_crc();
     test_dvparser();
-    test_linkmodes();
+    test_test();
+    test_devices();
+    /*
+      test_linkmodes();*/
     test_ids();
+    test_kdf();
+    test_periods();
     return 0;
 }
 
@@ -196,11 +213,22 @@ int test_dvparser()
     return 0;
 }
 
+int test_test()
+{
+    shared_ptr<SerialCommunicationManager> manager = createSerialCommunicationManager(0, false);
+
+    shared_ptr<SerialDevice> serial1 = manager->createSerialDeviceSimulator();
+
+    /*
+    shared_ptr<WMBus> wmbus_im871a = openIM871A("", manager, serial1);
+    manager->stop();*/
+    return 0;
+}
 
 int test_linkmodes()
 {
     LinkModeCalculationResult lmcr;
-    auto manager = createSerialCommunicationManager(0, 0, false);
+    auto manager = createSerialCommunicationManager(0, false);
 
     auto serial1 = manager->createSerialDeviceSimulator();
     auto serial2 = manager->createSerialDeviceSimulator();
@@ -209,15 +237,13 @@ int test_linkmodes()
 
     vector<string> no_meter_shells, no_meter_jsons;
 
-    unique_ptr<WMBus> wmbus_im871a = openIM871A("", manager.get(), std::move(serial1));
-
-    unique_ptr<WMBus> wmbus_amb8465 = openAMB8465("", manager.get(), std::move(serial2));
-    unique_ptr<WMBus> wmbus_rtlwmbus = openRTLWMBUS("", manager.get(), [](){}, std::move(serial3));
-    unique_ptr<WMBus> wmbus_rawtty = openRawTTY("", 0, manager.get(), std::move(serial4));
+    shared_ptr<WMBus> wmbus_im871a = openIM871A("", manager, serial1);
+    shared_ptr<WMBus> wmbus_amb8465 = openAMB8465("", manager, serial2);
+    shared_ptr<WMBus> wmbus_rtlwmbus = openRTLWMBUS("", "", manager, [](){}, serial3);
+    shared_ptr<WMBus> wmbus_rawtty = openRawTTY("", 0, manager, serial4);
 
     Configuration nometers_config;
     // Check that if no meters are supplied then you must set a link mode.
-    nometers_config.link_mode_configured = false;
     lmcr = calculateLinkModes(&nometers_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::NoMetersMustSupplyModes)
     {
@@ -225,8 +251,7 @@ int test_linkmodes()
     }
     debug("test0 OK\n\n");
 
-    nometers_config.link_mode_configured = true;
-    nometers_config.listen_to_link_modes.addLinkMode(LinkMode::T1);
+    nometers_config.default_device_linkmodes.addLinkMode(LinkMode::T1);
     lmcr = calculateLinkModes(&nometers_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::Success)
     {
@@ -244,7 +269,6 @@ int test_linkmodes()
     // Check that if no explicit link modes are provided to apator162, then
     // automatic deduction will fail, since apator162 can be configured to transmit
     // either C1 or T1 telegrams.
-    apator_config.link_mode_configured = false;
     lmcr = calculateLinkModes(&apator_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::AutomaticDeductionFailed)
     {
@@ -254,10 +278,9 @@ int test_linkmodes()
 
     // Check that if we supply the link mode T1 when using an apator162, then
     // automatic deduction will succeeed.
-    apator_config.link_mode_configured = true;
-    apator_config.listen_to_link_modes = LinkModeSet();
-    apator_config.listen_to_link_modes.addLinkMode(LinkMode::T1);
-    apator_config.listen_to_link_modes.addLinkMode(LinkMode::C1);
+    apator_config.default_device_linkmodes = LinkModeSet();
+    apator_config.default_device_linkmodes.addLinkMode(LinkMode::T1);
+    apator_config.default_device_linkmodes.addLinkMode(LinkMode::C1);
     lmcr = calculateLinkModes(&apator_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::DongleCannotListenTo)
     {
@@ -286,7 +309,6 @@ int test_linkmodes()
 
     // Check that meters that transmit on two different link modes cannot be listened to
     // at the same time using im871a.
-    multical21_and_supercom587_config.link_mode_configured = false;
     lmcr = calculateLinkModes(&multical21_and_supercom587_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::AutomaticDeductionFailed)
     {
@@ -295,9 +317,8 @@ int test_linkmodes()
     debug("test4 OK\n\n");
 
     // Explicitly set T1
-    multical21_and_supercom587_config.link_mode_configured = true;
-    multical21_and_supercom587_config.listen_to_link_modes = LinkModeSet();
-    multical21_and_supercom587_config.listen_to_link_modes.addLinkMode(LinkMode::T1);
+    multical21_and_supercom587_config.default_device_linkmodes = LinkModeSet();
+    multical21_and_supercom587_config.default_device_linkmodes.addLinkMode(LinkMode::T1);
     lmcr = calculateLinkModes(&multical21_and_supercom587_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::MightMissTelegrams)
     {
@@ -306,9 +327,8 @@ int test_linkmodes()
     debug("test5 OK\n\n");
 
     // Explicitly set N1a, but the meters transmit on C1 and T1.
-    multical21_and_supercom587_config.link_mode_configured = true;
-    multical21_and_supercom587_config.listen_to_link_modes = LinkModeSet();
-    multical21_and_supercom587_config.listen_to_link_modes.addLinkMode(LinkMode::N1a);
+    multical21_and_supercom587_config.default_device_linkmodes = LinkModeSet();
+    multical21_and_supercom587_config.default_device_linkmodes.addLinkMode(LinkMode::N1a);
     lmcr = calculateLinkModes(&multical21_and_supercom587_config, wmbus_im871a.get());
     if (lmcr.type != LinkModeCalculationResultType::MightMissTelegrams)
     {
@@ -317,9 +337,8 @@ int test_linkmodes()
     debug("test6 OK\n\n");
 
     // Explicitly set N1a, but it is an amber dongle.
-    multical21_and_supercom587_config.link_mode_configured = true;
-    multical21_and_supercom587_config.listen_to_link_modes = LinkModeSet();
-    multical21_and_supercom587_config.listen_to_link_modes.addLinkMode(LinkMode::N1a);
+    multical21_and_supercom587_config.default_device_linkmodes = LinkModeSet();
+    multical21_and_supercom587_config.default_device_linkmodes.addLinkMode(LinkMode::N1a);
     lmcr = calculateLinkModes(&multical21_and_supercom587_config, wmbus_amb8465.get());
     if (lmcr.type != LinkModeCalculationResultType::DongleCannotListenTo)
     {
@@ -327,6 +346,7 @@ int test_linkmodes()
     }
     debug("test7 OK\n\n");
 
+    manager->stop();
     return 0;
 }
 
@@ -410,4 +430,209 @@ void eqn(int a, int b, const char *tn)
     {
         printf("ERROR in test %s expected %d to be equal to %d\n", tn, a, b);
     }
+}
+
+void test_kdf()
+{
+    vector<uchar> key;
+    vector<uchar> input;
+    vector<uchar> mac;
+
+    hex2bin("2b7e151628aed2a6abf7158809cf4f3c", &key);
+    mac.resize(16);
+
+    AES_CMAC(&key[0], &input[0], 0, &mac[0]);
+    string s = bin2hex(mac);
+    string ex = "BB1D6929E95937287FA37D129B756746";
+    if (s != ex)
+    {
+        printf("ERROR in aes-cmac expected \"%s\" but got \"%s\"\n", ex.c_str(), s.c_str());
+    }
+
+
+    input.clear();
+    hex2bin("6bc1bee22e409f96e93d7e117393172a", &input);
+    AES_CMAC(&key[0], &input[0], 16, &mac[0]);
+    s = bin2hex(mac);
+    ex = "070A16B46B4D4144F79BDD9DD04A287C";
+
+    if (s != ex)
+    {
+        printf("ERROR in aes-cmac expected \"%s\" but got \"%s\"\n", ex.c_str(), s.c_str());
+    }
+}
+
+void testp(time_t now, string period, bool expected)
+{
+    bool rc = isInsideTimePeriod(now, period);
+
+    char buf[256];
+    struct tm now_tm {};
+    localtime_r(&now, &now_tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M %A", &now_tm);
+    string nows = buf;
+
+    if (expected == true && rc == false)
+    {
+        printf("ERROR in period test is \"%s\" in period \"%s\"? Expected true but got false!\n", nows.c_str(), period.c_str());
+    }
+    if (expected == false && rc == true)
+    {
+        printf("ERROR in period test is \"%s\" in period \"%s\"? Expected false but got true!\n", nows.c_str(), period.c_str());
+    }
+}
+
+void test_periods()
+{
+    // 3600*24*7+3600 means 1970-01-08 01:00 Thursday in Greenwich.
+    // However your local time is adjusted with your timezone.
+    // Get your timezone offset tm_gmtoff into the value.
+    time_t t = 3600*24*7+3600;
+    struct tm value {};
+    localtime_r(&t, &value);
+
+    // if tm_gmtoff is zero, then we are in Greenwich!
+    // if tm_gmtoff is 3600 then we are in Stockholm!
+
+    t -= value.tm_gmtoff;
+
+    // We have now adjusted the t so that it should be thursday at 1 am.
+    // The following test should therefore work inependently on
+    // where in the world this test is run.
+    testp(t, "mon-sun(00-23)", true);
+    testp(t, "mon(00-23)", false);
+    testp(t, "thu-fri(01-01)", true);
+    testp(t, "mon-wed(00-23),thu(02-23),fri-sun(00-23)", false);
+    testp(t, "mon-wed(00-23),thu(01-23),fri-sun(00-23)", true);
+    testp(t, "thu(00-00)", false);
+    testp(t, "thu(01-01)", true);
+}
+
+void testd(string arg, bool xok, string xfile, string xtype, string xid, string xfq, string xbps, string xlm, string xcmd)
+{
+    SpecifiedDevice d;
+    bool ok = d.parse(arg);
+    if (ok != xok)
+    {
+        printf("ERROR in device parse test \"%s\" expected %s but got %s\n", arg.c_str(), xok?"OK":"FALSE", ok?"OK":"FALSE");
+        return;
+    }
+    if (ok == false) return;
+
+    if (d.file != xfile ||
+        toString(d.type) != xtype ||
+        d.id != xid ||
+        d.fq != xfq ||
+        d.bps != xbps ||
+        d.linkmodes.hr() != xlm ||
+        d.command != xcmd)
+    {
+        printf("ERROR in device parsing parts \"%s\"\n", arg.c_str());
+    }
+}
+
+void test_devices()
+{
+    testd("/dev/ttyUSB0:im871a[12345678]:9600:868.95M:c1,t1", true,
+          "/dev/ttyUSB0", // file
+          "im871a", // type
+          "12345678", // id
+          "868.95M", // fq
+          "9600", // bps
+          "c1,t1", // linkmodes
+          ""); // command
+
+    testd("/dev/ttyUSB0:im871a:c1", true,
+          "/dev/ttyUSB0", // file
+          "im871a", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "c1", // linkmodes
+          ""); // command
+
+    testd("im871a[12345678]:c1", true,
+          "", // file
+          "im871a", // type
+          "12345678", // id
+          "", // fq
+          "", // bps
+          "c1", // linkmodes
+          ""); // command
+
+    testd("rtlwmbus:c1,t1:CMD(gurka)", true,
+          "", // file
+          "rtlwmbus", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "c1,t1", // linkmodes
+          "gurka"); // command
+
+    testd("rtlwmbus[plast]:c1,t1", true,
+          "", // file
+          "rtlwmbus", // type
+          "plast", // id
+          "", // fq
+          "", // bps
+          "c1,t1", // linkmodes
+          ""); // command
+
+    testd("stdin:rtlwmbus", true,
+          "stdin", // file
+          "rtlwmbus", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "none", // linkmodes
+          ""); // command
+
+    testd("/dev/ttyUSB0:rawtty:9600", true,
+          "/dev/ttyUSB0", // file
+          "rawtty", // type
+          "", // id
+          "", // fq
+          "9600", // bps
+          "none", // linkmodes
+          ""); // command
+
+    // testinternals must be run from a location where
+    // there is a Makefile.
+    testd("Makefile:simulation", true,
+          "Makefile", // file
+          "simulation", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "none", // linkmodes
+          ""); // command
+
+    testd("auto:c1,t1", true,
+          "", // file
+          "auto", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "c1,t1", // linkmodes
+          ""); // command
+
+    testd("auto:Makefile:c1,t1", false,
+          "", // file
+          "", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "none", // linkmodes
+          ""); // command
+
+    testd("Vatten", false,
+          "", // file
+          "", // type
+          "", // id
+          "", // fq
+          "", // bps
+          "none", // linkmodes
+          ""); // command
+
+
 }

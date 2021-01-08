@@ -1,5 +1,5 @@
 /*
- Copyright (C) 2017-2019 Fredrik Öhrström
+ Copyright (C) 2017-2020 Fredrik Öhrström
 
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -23,21 +23,105 @@
 
 #include<algorithm>
 #include<memory.h>
+#include<time.h>
+#include<cmath>
 
-MeterCommonImplementation::MeterCommonImplementation(WMBus *bus, MeterInfo &mi,
-                                                     MeterType type, int manufacturer) :
-    type_(type), name_(mi.name), bus_(bus)
+struct MeterManagerImplementation : public virtual MeterManager
 {
-    use_aes_ = true;
+    void addMeter(shared_ptr<Meter> meter)
+    {
+        meters_.push_back(meter);
+    }
+
+    Meter *lastAddedMeter()
+    {
+        return meters_.back().get();
+    }
+
+    void removeAllMeters()
+    {
+        meters_.clear();
+    }
+
+    void forEachMeter(std::function<void(Meter*)> cb)
+    {
+        for (auto &meter : meters_)
+        {
+            cb(meter.get());
+        }
+    }
+
+    bool hasAllMetersReceivedATelegram()
+    {
+        for (auto &meter : meters_)
+        {
+            if (meter->numUpdates() == 0) return false;
+        }
+
+        return true;
+    }
+
+    bool hasMeters()
+    {
+        return meters_.size() != 0;
+    }
+
+    bool handleTelegram(AboutTelegram &about, vector<uchar> data, bool simulated)
+    {
+        if (!hasMeters())
+        {
+            if (on_telegram_)
+            {
+                on_telegram_(about, data);
+            }
+            return true;
+        }
+
+        bool handled = false;
+
+        string id;
+        for (auto &m : meters_)
+        {
+            bool h = m->handleTelegram(about, data, simulated, &id);
+            if (h) handled = true;
+        }
+        if (isVerboseEnabled() && !handled)
+        {
+            verbose("(wmbus) telegram from %s ignored by all configured meters!\n", id.c_str());
+        }
+        return handled;
+    }
+
+    void onTelegram(function<void(AboutTelegram &about, vector<uchar>)> cb)
+    {
+        on_telegram_ = cb;
+    }
+    ~MeterManagerImplementation() {}
+
+private:
+
+    vector<shared_ptr<Meter>> meters_;
+    function<void(AboutTelegram&,vector<uchar>)> on_telegram_;
+};
+
+shared_ptr<MeterManager> createMeterManager()
+{
+    return shared_ptr<MeterManager>(new MeterManagerImplementation);
+}
+
+MeterCommonImplementation::MeterCommonImplementation(MeterInfo &mi,
+                                                     MeterType type) :
+    type_(type), name_(mi.name)
+{
     ids_ = splitMatchExpressions(mi.id);
-    if (mi.key.length() == 0) {
-        use_aes_ = false;
-    } else {
-        hex2bin(mi.key, &key_);
+    if (mi.key.length() > 0)
+    {
+        hex2bin(mi.key, &meter_keys_.confidentiality_key);
     }
-    if (manufacturer) {
-        manufacturers_.insert(manufacturer);
-    }
+    /*if (bus->type() == DEVICE_SIMULATION)
+    {
+        meter_keys_.simulation = true;
+    }*/
     for (auto s : mi.shells) {
         addShell(s);
     }
@@ -79,16 +163,6 @@ MeterType MeterCommonImplementation::type()
     return type_;
 }
 
-vector<int> MeterCommonImplementation::media()
-{
-    return media_;
-}
-
-void MeterCommonImplementation::addMedia(int m)
-{
-    media_.push_back(m);
-}
-
 void MeterCommonImplementation::addLinkMode(LinkMode lm)
 {
     link_modes_.addLinkMode(lm);
@@ -97,19 +171,26 @@ void MeterCommonImplementation::addLinkMode(LinkMode lm)
 void MeterCommonImplementation::addPrint(string vname, Quantity vquantity,
                                          function<double(Unit)> getValueFunc, string help, bool field, bool json)
 {
-    prints_.push_back( { vname, vquantity, defaultUnitForQuantity(vquantity), getValueFunc, NULL, help, field, json });
+    string default_unit = unitToStringLowerCase(defaultUnitForQuantity(vquantity));
+    string field_name = vname+"_"+default_unit;
+    fields_.push_back(field_name);
+    prints_.push_back( { vname, vquantity, defaultUnitForQuantity(vquantity), getValueFunc, NULL, help, field, json, field_name });
+}
+
+void MeterCommonImplementation::addPrint(string vname, Quantity vquantity, Unit unit,
+                                         function<double(Unit)> getValueFunc, string help, bool field, bool json)
+{
+    string default_unit = unitToStringLowerCase(defaultUnitForQuantity(vquantity));
+    string field_name = vname+"_"+default_unit;
+    fields_.push_back(field_name);
+    prints_.push_back( { vname, vquantity, unit, getValueFunc, NULL, help, field, json, field_name });
 }
 
 void MeterCommonImplementation::addPrint(string vname, Quantity vquantity,
                                          function<string()> getValueFunc,
                                          string help, bool field, bool json)
 {
-    prints_.push_back( { vname, vquantity, defaultUnitForQuantity(vquantity), NULL, getValueFunc, help, field, json } );
-}
-
-void MeterCommonImplementation::addManufacturer(int m)
-{
-    manufacturers_.insert(m);
+    prints_.push_back( { vname, vquantity, defaultUnitForQuantity(vquantity), NULL, getValueFunc, help, field, json, vname } );
 }
 
 vector<string> MeterCommonImplementation::ids()
@@ -117,14 +198,19 @@ vector<string> MeterCommonImplementation::ids()
     return ids_;
 }
 
+vector<string> MeterCommonImplementation::fields()
+{
+    return fields_;
+}
+
+vector<Print> MeterCommonImplementation::prints()
+{
+    return prints_;
+}
+
 string MeterCommonImplementation::name()
 {
     return name_;
-}
-
-WMBus *MeterCommonImplementation::bus()
-{
-    return bus_;
 }
 
 void MeterCommonImplementation::onUpdate(function<void(Telegram*,Meter*)> cb)
@@ -190,36 +276,41 @@ bool MeterCommonImplementation::isTelegramForMe(Telegram *t)
         return false;
     }
 
-    if (manufacturers_.count(t->m_field) == 0) {
-        // We are not that strict for the manufacturer.
-        // Simply warn.
-        warning("(meter) %s: probably not for me since manufacturer differs\n", name_.c_str());
-    }
+    if (!isMeterDriverValid(type_, t->dll_mfct, t->dll_type, t->dll_version))
+    {
+        // Are we using the right driver? Perhaps not since
+        // this particular driver, mfct, media, version combo
+        // is not registered in the METER_DETECTION list in meters.h
+        if (isVerboseEnabled() || isDebugEnabled() || !warned_for_telegram_before(t->dll_a))
+        {
+            string possible_drivers = t->autoDetectPossibleDrivers();
+            warning("(meter) %s: meter detection did not match the selected driver %s! correct driver is: %s\n"
+                    "(meter) Not printing this warning agin for id: %02x%02x%02x%02x mfct: (%s) %s (0x%02x) type: %s (0x%02x) ver: 0x%02x\n",
+                    name_.c_str(),
+                    toMeterName(type()).c_str(),
+                    possible_drivers.c_str(),
+                    t->dll_id_b[3], t->dll_id_b[2], t->dll_id_b[1], t->dll_id_b[0],
+                    manufacturerFlag(t->dll_mfct).c_str(),
+                    manufacturer(t->dll_mfct).c_str(),
+                    t->dll_mfct,
+                    mediaType(t->dll_type, t->dll_mfct).c_str(), t->dll_type,
+                    t->dll_version);
 
-    bool media_match = false;
-    for (auto m : media_) {
-        if (m == t->a_field_device_type) {
-            media_match = true;
-            break;
+            if (possible_drivers == "unknown!")
+            {
+                warning("(meter) please consider opening an issue at https://github.com/weetmuts/wmbusmeters/\n");
+                warning("(meter) to add support for this unknown mfct,media,version combination\n");
+            }
         }
-    }
-
-    if (!media_match) {
-        warning("(meter) %s: probably not for me since media does not match\n", name_.c_str());
     }
 
     debug("(meter) %s: yes for me\n", name_.c_str());
     return true;
 }
 
-bool MeterCommonImplementation::useAes()
+MeterKeys *MeterCommonImplementation::meterKeys()
 {
-    return use_aes_;
-}
-
-vector<uchar> MeterCommonImplementation::key()
-{
-    return key_;
+    return &meter_keys_;
 }
 
 vector<string> MeterCommonImplementation::getRecords()
@@ -250,7 +341,7 @@ void MeterCommonImplementation::triggerUpdate(Telegram *t)
     t->handled = true;
 }
 
-string concatFields(Meter *m, Telegram *t, char c, vector<Print> &prints, vector<Unit> &cs, bool hr)
+string concatAllFields(Meter *m, Telegram *t, char c, vector<Print> &prints, vector<Unit> &cs, bool hr)
 {
     string s;
     s = "";
@@ -282,54 +373,136 @@ string concatFields(Meter *m, Telegram *t, char c, vector<Print> &prints, vector
     return s;
 }
 
-void MeterCommonImplementation::handleTelegram(Telegram *t)
+string concatFields(Meter *m, Telegram *t, char c, vector<Print> &prints, vector<Unit> &cs, bool hr,
+                    vector<string> *selected_fields)
 {
-    if (!isTelegramForMe(t)) {
-        // This telegram is not intended for this meter.
-        return;
-    }
-
-    verbose("(%s) %s %02x%02x%02x%02x ",
-            meterName().c_str(),
-            name().c_str(),
-            t->a_field_address[0], t->a_field_address[1], t->a_field_address[2],
-            t->a_field_address[3]);
-
-    t->expectVersion(meterName().c_str(), expectedVersion());
-
-    if (t->isEncrypted() && !useAes() && !t->isSimulated())
+    if (selected_fields == NULL || selected_fields->size() == 0)
     {
-        warning("(%s) warning: telegram is encrypted but no key supplied!\n",
-                meterName().c_str());
+        return concatAllFields(m, t, c, prints, cs, hr);
     }
-    if (useAes()) {
-        vector<uchar> aeskey = key();
-        if (encryptionMode() == EncryptionMode::AES_CTR) {
-            decryptMode1_AES_CTR(t, aeskey);
+    string s;
+    s = "";
+
+    for (string field : *selected_fields)
+    {
+        if (field == "name")
+        {
+            s += m->name() + c;
+            continue;
         }
-        if (encryptionMode() == EncryptionMode::AES_CBC) {
-            decryptMode5_AES_CBC(t, aeskey);
+        if (field == "id")
+        {
+            s += t->id + c;
+            continue;
         }
-    } else {
-        t->content = t->payload;
+        if (field == "timestamp")
+        {
+            s += m->datetimeOfUpdateHumanReadable() + c;
+            continue;
+        }
+        if (field == "device")
+        {
+            s += t->about.device + c;
+            continue;
+        }
+        if (field == "rssi_dbm")
+        {
+            s += to_string(t->about.rssi_dbm) + c;
+            continue;
+        }
+
+        bool handled = false;
+        for (Print p : prints)
+        {
+            if (p.getValueString)
+            {
+                if (field == p.vname)
+                {
+                    s += p.getValueString() + c;
+                    handled = true;
+                }
+            }
+            else if (p.getValueDouble)
+            {
+                string default_unit = unitToStringLowerCase(p.default_unit);
+                string var = p.vname+"_"+default_unit;
+                if (field == var)
+                {
+                    s += valueToString(p.getValueDouble(p.default_unit), p.default_unit) + c;
+                    handled = true;
+                }
+                else
+                {
+                    Unit u = replaceWithConversionUnit(p.default_unit, cs);
+                    if (u != p.default_unit)
+                    {
+                        string unit = unitToStringLowerCase(u);
+                        string var = p.vname+"_"+unit;
+                        if (field == var)
+                        {
+                            s += valueToString(p.getValueDouble(u), u) + c;
+                            handled = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!handled)
+        {
+            s += "?"+field+"?"+c;
+        }
+    }
+    if (s.back() == c) s.pop_back();
+    return s;
+}
+
+bool MeterCommonImplementation::handleTelegram(AboutTelegram &about, vector<uchar> input_frame, bool simulated, string *id)
+{
+    Telegram t;
+    t.about = about;
+    bool ok = t.parseHeader(input_frame);
+
+    if (simulated) t.markAsSimulated();
+
+    *id = t.id;
+
+    if (!ok || !isTelegramForMe(&t))
+    {
+        // This telegram is not intended for this meter.
+        return false;
+    }
+
+    verbose("(meter) %s %s handling telegram from %s\n", name().c_str(), meterName().c_str(), t.id.c_str());
+
+    if (isDebugEnabled())
+    {
+        string msg = bin2hex(input_frame);
+        debug("(meter) %s %s \"%s\"\n", name().c_str(), t.id.c_str(), msg.c_str());
+    }
+
+    ok = t.parse(input_frame, &meter_keys_);
+    if (!ok)
+    {
+        // Ignoring telegram since it could not be parsed.
+        return false;
     }
 
     char log_prefix[256];
     snprintf(log_prefix, 255, "(%s) log", meterName().c_str());
-    logTelegram(log_prefix, t->parsed, t->content);
-    int content_start = t->parsed.size();
+    logTelegram(t.frame, t.header_size, t.suffix_size);
 
     // Invoke meter specific parsing!
-    processContent(t);
+    processContent(&t);
     // All done....
 
     if (isDebugEnabled())
     {
         char log_prefix[256];
         snprintf(log_prefix, 255, "(%s)", meterName().c_str());
-        t->explainParse(log_prefix, content_start);
+        t.explainParse(log_prefix, 0);
     }
-    triggerUpdate(t);
+    triggerUpdate(&t);
+    return true;
 }
 
 void MeterCommonImplementation::printMeter(Telegram *t,
@@ -337,14 +510,15 @@ void MeterCommonImplementation::printMeter(Telegram *t,
                                            string *fields, char separator,
                                            string *json,
                                            vector<string> *envs,
-                                           vector<string> *more_json)
+                                           vector<string> *more_json,
+                                           vector<string> *selected_fields)
 {
-    *human_readable = concatFields(this, t, '\t', prints_, conversions_, true);
-    *fields = concatFields(this, t, separator, prints_, conversions_, false);
+    *human_readable = concatFields(this, t, '\t', prints_, conversions_, true, selected_fields);
+    *fields = concatFields(this, t, separator, prints_, conversions_, false, selected_fields);
 
     string s;
     s += "{";
-    s += "\"media\":\""+mediaTypeJSON(t->a_field_device_type)+"\",";
+    s += "\"media\":\""+mediaTypeJSON(t->dll_type, t->dll_mfct)+"\",";
     s += "\"meter\":\""+meterName()+"\",";
     s += "\"name\":\""+name()+"\",";
     s += "\"id\":\""+t->id+"\",";
@@ -370,6 +544,12 @@ void MeterCommonImplementation::printMeter(Telegram *t,
         }
     }
     s += "\"timestamp\":\""+datetimeOfUpdateRobot()+"\"";
+    if (t->about.device != "")
+    {
+        s += ",";
+        s += "\"device\":\""+t->about.device+"\",";
+        s += "\"rssi_dbm\":"+to_string(t->about.rssi_dbm);
+    }
     for (string add_json : additionalJsons())
     {
         s += ",";
@@ -426,55 +606,77 @@ void MeterCommonImplementation::printMeter(Telegram *t,
     }
 }
 
-double WaterMeter::totalWaterConsumption(Unit u) { return -47.11; }
+double WaterMeter::totalWaterConsumption(Unit u) { return -NAN; }
 bool  WaterMeter::hasTotalWaterConsumption() { return false; }
-double WaterMeter::targetWaterConsumption(Unit u) { return -47.11; }
+double WaterMeter::targetWaterConsumption(Unit u) { return -NAN; }
 bool  WaterMeter::hasTargetWaterConsumption() { return false; }
-double WaterMeter::maxFlow(Unit u) { return -47.11; }
+double WaterMeter::maxFlow(Unit u) { return -NAN; }
 bool  WaterMeter::hasMaxFlow() { return false; }
-double WaterMeter::flowTemperature(Unit u) { return -47.11; }
+double WaterMeter::flowTemperature(Unit u) { return -NAN; }
 bool WaterMeter::hasFlowTemperature() { return false; }
-double WaterMeter::externalTemperature(Unit u) { return -47.11; }
+double WaterMeter::externalTemperature(Unit u) { return -NAN; }
 bool WaterMeter::hasExternalTemperature() { return false; }
 
-string WaterMeter::statusHumanReadable() { return "-47.11"; }
-string WaterMeter::status() { return "-47.11"; }
-string WaterMeter::timeDry() { return "-47.11"; }
-string WaterMeter::timeReversed() { return "-47.11"; }
-string WaterMeter::timeLeaking() { return "-47.11"; }
-string WaterMeter::timeBursting() { return "-47.11"; }
+string WaterMeter::statusHumanReadable() { return "-NAN"; }
+string WaterMeter::status() { return "-NAN"; }
+string WaterMeter::timeDry() { return "-NAN"; }
+string WaterMeter::timeReversed() { return "-NAN"; }
+string WaterMeter::timeLeaking() { return "-NAN"; }
+string WaterMeter::timeBursting() { return "-NAN"; }
 
-double HeatMeter::totalEnergyConsumption(Unit u) { return -47.11; }
-double HeatMeter::currentPeriodEnergyConsumption(Unit u) { return -47.11; }
-double HeatMeter::previousPeriodEnergyConsumption(Unit u) { return -47.11; }
-double HeatMeter::currentPowerConsumption(Unit u) { return -47.11; }
-double HeatMeter::totalVolume(Unit u) { return -47.11; }
+double HeatMeter::totalEnergyConsumption(Unit u) { return -NAN; }
+double HeatMeter::currentPeriodEnergyConsumption(Unit u) { return -NAN; }
+double HeatMeter::previousPeriodEnergyConsumption(Unit u) { return -NAN; }
+double HeatMeter::currentPowerConsumption(Unit u) { return -NAN; }
+double HeatMeter::totalVolume(Unit u) { return -NAN; }
 
-double ElectricityMeter::totalEnergyConsumption(Unit u) { return -47.11; }
-double ElectricityMeter::currentPowerConsumption(Unit u) { return -47.11; }
-double ElectricityMeter::totalEnergyProduction(Unit u) { return -47.11; }
-double ElectricityMeter::currentPowerProduction(Unit u) { return -47.11; }
+double ElectricityMeter::totalEnergyConsumption(Unit u) { return -NAN; }
+double ElectricityMeter::totalEnergyProduction(Unit u) { return -NAN; }
+double ElectricityMeter::totalReactiveEnergyConsumption(Unit u) { return -NAN; }
+double ElectricityMeter::totalReactiveEnergyProduction(Unit u) { return -NAN; }
+double ElectricityMeter::totalApparentEnergyConsumption(Unit u) { return -NAN; }
+double ElectricityMeter::totalApparentEnergyProduction(Unit u) { return -NAN; }
 
-double HeatCostMeter::currentConsumption(Unit u) { return -47.11; }
-string HeatCostMeter::setDate() { return "47.11"; }
-double HeatCostMeter::consumptionAtSetDate(Unit u) { return -47.11; }
+double ElectricityMeter::currentPowerConsumption(Unit u) { return -NAN; }
+double ElectricityMeter::currentPowerProduction(Unit u) { return -NAN; }
 
-void MeterCommonImplementation::setEncryptionMode(EncryptionMode em)
+double HeatCostAllocationMeter::currentConsumption(Unit u) { return -NAN; }
+string HeatCostAllocationMeter::setDate() { return "NAN"; }
+double HeatCostAllocationMeter::consumptionAtSetDate(Unit u) { return -NAN; }
+
+void MeterCommonImplementation::setExpectedTPLSecurityMode(TPLSecurityMode tsm)
 {
-    enc_mode_ = em;
+    expected_tpl_sec_mode_ = tsm;
 }
 
-EncryptionMode MeterCommonImplementation::encryptionMode()
+void MeterCommonImplementation::setExpectedELLSecurityMode(ELLSecurityMode dsm)
 {
-    return enc_mode_;
+    expected_ell_sec_mode_ = dsm;
 }
 
-void MeterCommonImplementation::setExpectedVersion(int version)
+TPLSecurityMode MeterCommonImplementation::expectedTPLSecurityMode()
 {
-    expected_meter_version_ = version;
+    return expected_tpl_sec_mode_;
 }
 
-int MeterCommonImplementation::expectedVersion()
+ELLSecurityMode MeterCommonImplementation::expectedELLSecurityMode()
 {
-    return expected_meter_version_;
+    return expected_ell_sec_mode_;
+}
+
+void detectMeterDriver(int manufacturer, int media, int version, vector<string> *drivers)
+{
+    drivers->clear();
+#define X(TY,MA,ME,VE) { if (manufacturer == MA && (media == ME || ME == -1) && (version == VE || VE == -1)) { drivers->push_back(toMeterName(MeterType::TY)); }}
+METER_DETECTION
+#undef X
+}
+
+bool isMeterDriverValid(MeterType type, int manufacturer, int media, int version)
+{
+#define X(TY,MA,ME,VE) { if (type == MeterType::TY && manufacturer == MA && (media == ME || ME == -1) && (version == VE || VE == -1)) { return true; }}
+METER_DETECTION
+#undef X
+
+    return false;
 }
